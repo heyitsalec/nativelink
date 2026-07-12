@@ -45,6 +45,34 @@ const BUCKET_NAME: &str = "dummy-bucket-name";
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 const REGION: &str = "testregion";
 
+// Coverage for https://github.com/TraceMachina/nativelink/issues/1842: the
+// S3 connect timeout (and the optional operation timeout) are configurable
+// and default to the previous behavior when unset.
+#[nativelink_test]
+async fn s3_spec_deserializes_connection_and_operation_timeouts() -> Result<(), Error> {
+    let spec: ExperimentalAwsSpec = serde_json::from_str(
+        r#"{
+            "region": "testregion",
+            "bucket": "dummy-bucket-name",
+            "connection_timeout_s": 120,
+            "operation_timeout_s": 300
+        }"#,
+    )
+    .map_err(|e| make_input_err!("{e}"))?;
+    assert_eq!(spec.connection_timeout_s, 120);
+    assert_eq!(spec.operation_timeout_s, 300);
+
+    // Old configs without the new fields must still load, defaulting to zero
+    // (which the store maps to the historical 15s connect timeout and no
+    // operation timeout).
+    let default_spec: ExperimentalAwsSpec =
+        serde_json::from_str(r#"{"region": "testregion", "bucket": "dummy-bucket-name"}"#)
+            .map_err(|e| make_input_err!("{e}"))?;
+    assert_eq!(default_spec.connection_timeout_s, 0);
+    assert_eq!(default_spec.operation_timeout_s, 0);
+    Ok(())
+}
+
 #[nativelink_test]
 async fn simple_has_object_found() -> Result<(), Error> {
     let mock_client = StaticReplayClient::new(vec![ReplayEvent::new(

@@ -103,6 +103,8 @@ pub enum StoreSpec {
     ///     "region": "eu-north-1",
     ///     "bucket": "crossplane-bucket-af79aeca9",
     ///     "key_prefix": "test-prefix-index/",
+    ///     "connection_timeout_s": 30,
+    ///     "operation_timeout_s": 600,
     ///     "retry": {
     ///       "max_retries": 6,
     ///       "delay": 0.3,
@@ -1145,6 +1147,22 @@ pub struct ExperimentalAwsSpec {
     /// Bucket name to use as the backend.
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub bucket: String,
+
+    /// Time in seconds to wait for a connection to the S3 endpoint to be
+    /// established before timing out.
+    ///
+    /// Default: 15. Zero means use the default.
+    #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    pub connection_timeout_s: u64,
+
+    /// Time in seconds to allow a single S3 operation (including any retries
+    /// performed internally by the AWS SDK) to complete before timing out.
+    /// The store's own `retry` configuration decides whether a timed-out
+    /// operation is retried.
+    ///
+    /// Default: 0. Zero means no operation timeout is applied.
+    #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    pub operation_timeout_s: u64,
 
     /// Common retry and upload configuration
     #[serde(flatten)]

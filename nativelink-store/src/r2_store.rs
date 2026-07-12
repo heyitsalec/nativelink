@@ -96,6 +96,10 @@ impl R2Store {
         ExperimentalAwsSpec {
             region: "auto".to_string(),
             bucket: spec.bucket.clone(),
+            // R2 builds its own SDK client, so the S3 timeout fields are
+            // unused here; zero means "S3Store defaults" if it ever changes.
+            connection_timeout_s: 0,
+            operation_timeout_s: 0,
             common: spec.common.clone(),
         }
     }
