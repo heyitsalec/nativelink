@@ -44,7 +44,7 @@ use nativelink_scheduler::awaited_action_db::{
 };
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
 use nativelink_scheduler::simple_scheduler::SimpleScheduler;
-use nativelink_scheduler::worker::Worker;
+use nativelink_scheduler::worker::{WORKER_ERROR_DRAIN_COOLDOWN_S, Worker};
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::action_messages::{
     ActionInfo, ActionResult, ActionStage, ActionState, DirectoryInfo, ExecutionMetadata, FileInfo,
@@ -783,6 +783,17 @@ async fn set_drain_worker_pauses_and_resumes_worker_test() -> Result<(), Error> 
         };
         assert_eq!(action_state.as_ref(), &expected_action_state);
     }
+
+    // The admin drain is independent of the error-drain cooldown: even a
+    // keep-alive far past the cooldown window does not lift it.
+    scheduler
+        .worker_keep_alive_received(&worker_id, NOW_TIME + WORKER_ERROR_DRAIN_COOLDOWN_S + 1)
+        .await?;
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        rx_from_worker.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 
     // Set the worker not draining.
     scheduler.set_drain_worker(&worker_id, false).await?;
@@ -2275,6 +2286,549 @@ async fn worker_retries_on_internal_error_and_fails_test() -> Result<(), Error> 
         }
         assert_eq!(received_state, expected_action_state);
     }
+
+    Ok(())
+}
+
+/// Regression test for <https://github.com/TraceMachina/nativelink/issues/128>.
+/// A worker that reports CONSECUTIVE infrastructure-class errors
+/// (`Code::Internal`) is error-drained: it stays connected and may finish
+/// its in-flight actions, but no new actions are scheduled on it until its
+/// cooldown elapses, so a bad node cannot keep poisoning the retries of the
+/// actions that fail on it. A single error never drains.
+#[nativelink_test]
+async fn worker_error_drains_after_consecutive_infra_errors_test() -> Result<(), Error> {
+    let worker_id1 = WorkerId("worker1".to_string());
+    let worker_id2 = WorkerId("worker2".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            // High enough that the retried action never fails terminally.
+            max_job_retries: 10,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    let mut rx_from_worker1 = setup_new_worker(
+        &scheduler,
+        worker_id1.clone(),
+        PlatformProperties::default(),
+    )
+    .await?;
+
+    // Put two actions in flight on worker1 (`setup_new_worker` places no
+    // inflight limit on the worker).
+    let mut action1_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([99u8; 32], 512),
+        HashMap::new(),
+        make_system_time(1),
+    )
+    .await?;
+    let operation_id1 = match rx_from_worker1.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(exec)) => OperationId::from(exec.operation_id),
+        v => panic!("Expected StartAction, got : {v:?}"),
+    };
+    assert_eq!(
+        action1_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    let mut action2_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([88u8; 32], 512),
+        HashMap::new(),
+        make_system_time(2),
+    )
+    .await?;
+    let operation_id2 = match rx_from_worker1.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(exec)) => OperationId::from(exec.operation_id),
+        v => panic!("Expected StartAction, got : {v:?}"),
+    };
+    assert_eq!(
+        action2_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    // First infrastructure-class error: below the threshold of 2, so the
+    // worker stays in rotation and the requeued action comes right back.
+    drop(
+        scheduler
+            .update_action(
+                &worker_id1,
+                &operation_id1,
+                UpdateOperationType::UpdateWithError(make_err!(
+                    Code::Internal,
+                    "Failed to spawn process"
+                )),
+            )
+            .await,
+    );
+    match rx_from_worker1.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+
+    // Second consecutive infrastructure-class error: the worker is
+    // error-drained before the operation is requeued, so the matcher can
+    // never hand the action back to it and the queued state is stable.
+    drop(
+        scheduler
+            .update_action(
+                &worker_id1,
+                &operation_id1,
+                UpdateOperationType::UpdateWithError(make_err!(
+                    Code::Internal,
+                    "Failed to spawn process"
+                )),
+            )
+            .await,
+    );
+    assert_eq!(
+        action1_listener.changed().await.unwrap().0.stage,
+        ActionStage::Queued
+    );
+    tokio::task::yield_now().await; // Allow task<->worker matcher to run.
+
+    // The drained worker must not be selected for the queued action, and it
+    // must not be disconnected either. An `Empty` channel proves no
+    // `StartAction` and no `Disconnect` was sent and the scheduler still
+    // holds the connection.
+    assert!(matches!(
+        rx_from_worker1.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    // In-flight work on the drained worker is allowed to finish. The
+    // successful completion resets the error streak but does NOT lift the
+    // drain: only the cooldown does that.
+    scheduler
+        .update_action(
+            &worker_id1,
+            &operation_id2,
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ActionResult {
+                exit_code: 0,
+                ..ActionResult::default()
+            })),
+        )
+        .await?;
+    match &action2_listener.changed().await.unwrap().0.stage {
+        ActionStage::Completed(action_result) => assert_eq!(action_result.exit_code, 0),
+        v => panic!("Expected Completed, got : {v:?}"),
+    }
+    tokio::task::yield_now().await; // Allow task<->worker matcher to run.
+    assert!(matches!(
+        rx_from_worker1.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    // A healthy worker picks up the queued action immediately.
+    let mut rx_from_worker2 = setup_new_worker(
+        &scheduler,
+        worker_id2.clone(),
+        PlatformProperties::default(),
+    )
+    .await?;
+    match rx_from_worker2.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+    assert_eq!(
+        action1_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+    // Worker1 was passed over the whole time.
+    assert!(matches!(
+        rx_from_worker1.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    Ok(())
+}
+
+/// The error-drain from issue #128 self-heals: once the drained worker's
+/// keep-alives show `WORKER_ERROR_DRAIN_COOLDOWN_S` elapsed, it returns to
+/// rotation on its own and picks queued work back up. A keep-alive inside
+/// the cooldown window changes nothing.
+#[nativelink_test]
+async fn error_drained_worker_recovers_after_cooldown_test() -> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            max_job_retries: 10,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+    let mut action_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([99u8; 32], 512),
+        HashMap::new(),
+        make_system_time(1),
+    )
+    .await?;
+    let operation_id = match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(exec)) => OperationId::from(exec.operation_id),
+        v => panic!("Expected StartAction, got : {v:?}"),
+    };
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    // First infrastructure-class error: streak 1, still below the
+    // threshold, so the requeued action is redispatched to the worker.
+    drop(
+        scheduler
+            .update_action(
+                &worker_id,
+                &operation_id,
+                UpdateOperationType::UpdateWithError(make_err!(
+                    Code::Internal,
+                    "Failed to spawn process"
+                )),
+            )
+            .await,
+    );
+    match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+
+    // Second consecutive infrastructure-class error drains the worker.
+    drop(
+        scheduler
+            .update_action(
+                &worker_id,
+                &operation_id,
+                UpdateOperationType::UpdateWithError(make_err!(
+                    Code::Internal,
+                    "Failed to spawn process"
+                )),
+            )
+            .await,
+    );
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Queued
+    );
+    tokio::task::yield_now().await; // Allow task<->worker matcher to run.
+    assert!(matches!(
+        rx_from_worker.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    // A keep-alive inside the cooldown window does not lift the drain.
+    scheduler
+        .worker_keep_alive_received(&worker_id, NOW_TIME + WORKER_ERROR_DRAIN_COOLDOWN_S / 2)
+        .await?;
+    tokio::task::yield_now().await; // Allow task<->worker matcher to run.
+    assert!(matches!(
+        rx_from_worker.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    // Once keep-alives show the cooldown elapsed, the worker returns to
+    // rotation and receives the queued action again.
+    scheduler
+        .worker_keep_alive_received(&worker_id, NOW_TIME + WORKER_ERROR_DRAIN_COOLDOWN_S + 1)
+        .await?;
+    match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    Ok(())
+}
+
+/// A successfully delivered action update breaks the infrastructure-error
+/// streak: error, success, error never reaches the threshold of 2
+/// consecutive errors, so the worker is never drained.
+#[nativelink_test]
+async fn infra_error_streak_reset_by_success_test() -> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            max_job_retries: 10,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+
+    // Action 1: one infrastructure error (streak 1), then the redispatched
+    // action completes successfully (streak reset to 0).
+    let mut action1_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([99u8; 32], 512),
+        HashMap::new(),
+        make_system_time(1),
+    )
+    .await?;
+    let operation_id1 = match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(exec)) => OperationId::from(exec.operation_id),
+        v => panic!("Expected StartAction, got : {v:?}"),
+    };
+    assert_eq!(
+        action1_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+    drop(
+        scheduler
+            .update_action(
+                &worker_id,
+                &operation_id1,
+                UpdateOperationType::UpdateWithError(make_err!(
+                    Code::Internal,
+                    "Failed to spawn process"
+                )),
+            )
+            .await,
+    );
+    match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+    scheduler
+        .update_action(
+            &worker_id,
+            &operation_id1,
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ActionResult {
+                exit_code: 0,
+                ..ActionResult::default()
+            })),
+        )
+        .await?;
+
+    // Action 2: another single infrastructure error. Without the streak
+    // reset this would be the second consecutive error and would drain the
+    // worker; with it, the worker stays in rotation and gets the action
+    // right back.
+    let mut action2_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([88u8; 32], 512),
+        HashMap::new(),
+        make_system_time(2),
+    )
+    .await?;
+    let operation_id2 = match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(exec)) => OperationId::from(exec.operation_id),
+        v => panic!("Expected StartAction, got : {v:?}"),
+    };
+    assert_eq!(
+        action2_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+    drop(
+        scheduler
+            .update_action(
+                &worker_id,
+                &operation_id2,
+                UpdateOperationType::UpdateWithError(make_err!(
+                    Code::Internal,
+                    "Failed to spawn process"
+                )),
+            )
+            .await,
+    );
+    match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+
+    Ok(())
+}
+
+/// A legitimate action failure (the action ran and exited non-zero) is an
+/// action-level outcome, not a worker fault; it must not drain the worker
+/// (issue #128 policy).
+#[nativelink_test]
+async fn action_failure_does_not_drain_worker_test() -> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+
+    let mut action1_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([99u8; 32], 512),
+        HashMap::new(),
+        make_system_time(1),
+    )
+    .await?;
+    let operation_id = match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(exec)) => OperationId::from(exec.operation_id),
+        v => panic!("Expected StartAction, got : {v:?}"),
+    };
+    assert_eq!(
+        action1_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    // The action ran to completion and failed (non-zero exit code). This is
+    // reported as a completed stage, never as `UpdateWithError`.
+    scheduler
+        .update_action(
+            &worker_id,
+            &operation_id,
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ActionResult {
+                exit_code: 1,
+                ..ActionResult::default()
+            })),
+        )
+        .await?;
+    match &action1_listener.changed().await.unwrap().0.stage {
+        ActionStage::Completed(action_result) => assert_eq!(action_result.exit_code, 1),
+        v => panic!("Expected Completed, got : {v:?}"),
+    }
+
+    // The worker stays in rotation: a new action is scheduled onto it.
+    let mut action2_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([88u8; 32], 512),
+        HashMap::new(),
+        make_system_time(2),
+    )
+    .await?;
+    match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+    assert_eq!(
+        action2_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    Ok(())
+}
+
+/// Action-level error codes never count toward the error-drain streak.
+/// `DeadlineExceeded` (the action ran over its own timeout) is
+/// representative of the class of codes (`DeadlineExceeded`, `Cancelled`,
+/// `Aborted`, `NotFound`, `FailedPrecondition`, `ResourceExhausted`, ...)
+/// that describe the action or shared infrastructure rather than a broken
+/// worker; even repeated back-to-back they leave the worker eligible and it
+/// picks the retried action right back up each time.
+#[nativelink_test]
+async fn action_level_error_does_not_drain_worker_test() -> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            max_job_retries: 10,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+
+    let mut action_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([99u8; 32], 512),
+        HashMap::new(),
+        make_system_time(1),
+    )
+    .await?;
+    let mut operation_id = match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(exec)) => OperationId::from(exec.operation_id),
+        v => panic!("Expected StartAction, got : {v:?}"),
+    };
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    // Two back-to-back action-level errors: were these infra-class, the
+    // second one would drain the worker. Instead the worker receives the
+    // retried action again both times.
+    for _ in 0..2 {
+        drop(
+            scheduler
+                .update_action(
+                    &worker_id,
+                    &operation_id,
+                    UpdateOperationType::UpdateWithError(make_err!(
+                        Code::DeadlineExceeded,
+                        "Action timed out"
+                    )),
+                )
+                .await,
+        );
+        operation_id = match rx_from_worker.recv().await.unwrap().update {
+            Some(update_for_worker::Update::StartAction(exec)) => {
+                OperationId::from(exec.operation_id)
+            }
+            v => panic!("Expected StartAction, got : {v:?}"),
+        };
+    }
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
 
     Ok(())
 }

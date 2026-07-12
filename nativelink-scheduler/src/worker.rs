@@ -30,6 +30,21 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub type WorkerTimestamp = u64;
 
+/// Number of consecutive infrastructure-class errors a worker may report
+/// before it is error-drained (issue #128). A single transient error (for
+/// example one failed store round-trip) never drains a worker.
+pub const CONSECUTIVE_INFRA_ERROR_DRAIN_THRESHOLD: u32 = 2;
+
+/// How long an error-drained worker stays out of rotation, in seconds,
+/// measured in the worker's own keep-alive clock domain
+/// (`last_update_timestamp`). Error-drains self-heal after this cooldown,
+/// unlike the operator-controlled admin drain (`is_draining`), which never
+/// expires. The value is a compromise: long enough to shed load from a
+/// genuinely broken node between retries, short enough that a fleet-wide
+/// drain caused by a shared-store outage costs at most about a minute of
+/// capacity after the outage ends.
+pub const WORKER_ERROR_DRAIN_COOLDOWN_S: WorkerTimestamp = 60;
+
 /// Represents the action info and the platform properties of the action.
 /// These platform properties have the type of the properties as well as
 /// the value of the properties, unlike `ActionInfo`, which only has the
@@ -100,6 +115,20 @@ pub struct Worker {
     #[metric(help = "If the worker is draining.")]
     pub is_draining: bool,
 
+    /// Number of consecutive infrastructure-class errors reported by this
+    /// worker without an intervening successfully delivered action update.
+    /// See `is_worker_infrastructure_failure` in `api_worker_scheduler.rs`.
+    pub consecutive_infra_errors: u32,
+
+    /// When set, the worker-clock timestamp (`last_update_timestamp` at
+    /// drain time) at which this worker was error-drained after
+    /// [`CONSECUTIVE_INFRA_ERROR_DRAIN_THRESHOLD`] consecutive
+    /// infrastructure-class errors. Cleared automatically once keep-alives
+    /// advance `last_update_timestamp` past the
+    /// [`WORKER_ERROR_DRAIN_COOLDOWN_S`] cooldown, unlike the
+    /// operator-controlled `is_draining`, which never expires.
+    pub error_drained_at: Option<WorkerTimestamp>,
+
     /// Maximum inflight tasks for this worker (or 0 for unlimited)
     #[metric(help = "Maximum inflight tasks for this worker (or 0 for unlimited)")]
     pub max_inflight_tasks: u64,
@@ -154,6 +183,8 @@ impl Worker {
             last_update_timestamp: timestamp,
             is_paused: false,
             is_draining: false,
+            consecutive_infra_errors: 0,
+            error_drained_at: None,
             max_inflight_tasks,
             metrics: Arc::new(Metrics {
                 connected_timestamp: SystemTime::now()
@@ -282,9 +313,21 @@ impl Worker {
         }
     }
 
+    /// True while this worker is held out of rotation after consecutive
+    /// infrastructure-class errors (issue #128). The hold expires on its own
+    /// once the worker's keep-alives show [`WORKER_ERROR_DRAIN_COOLDOWN_S`]
+    /// seconds elapsed since the drain, unlike the admin-controlled
+    /// `is_draining`.
+    pub fn is_error_drained(&self) -> bool {
+        self.error_drained_at.is_some_and(|drained_at| {
+            self.last_update_timestamp < drained_at.saturating_add(WORKER_ERROR_DRAIN_COOLDOWN_S)
+        })
+    }
+
     pub fn can_accept_work(&self) -> bool {
         !self.is_paused
             && !self.is_draining
+            && !self.is_error_drained()
             && (self.max_inflight_tasks == 0
                 || u64::try_from(self.running_action_infos.len()).unwrap_or(u64::MAX)
                     < self.max_inflight_tasks)

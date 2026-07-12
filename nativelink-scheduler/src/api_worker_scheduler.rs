@@ -63,13 +63,62 @@ pub struct SchedulerMetrics {
     pub keep_alive_updates: AtomicU64,
     /// Total number of worker timeouts.
     pub worker_timeouts: AtomicU64,
+    /// Total number of times a worker was error-drained after consecutive
+    /// infrastructure-class errors (issue #128). Global counter with no
+    /// per-worker labels; the drain warning log line carries the worker id.
+    pub workers_error_drained: AtomicU64,
 }
 
 use crate::platform_property_manager::PlatformPropertyManager;
-use crate::worker::{ActionInfoWithProps, Worker, WorkerTimestamp, WorkerUpdate};
+use crate::worker::{
+    ActionInfoWithProps, CONSECUTIVE_INFRA_ERROR_DRAIN_THRESHOLD, WORKER_ERROR_DRAIN_COOLDOWN_S,
+    Worker, WorkerTimestamp, WorkerUpdate,
+};
 use crate::worker_capability_index::WorkerCapabilityIndex;
 use crate::worker_registry::SharedWorkerRegistry;
 use crate::worker_scheduler::WorkerScheduler;
+
+/// Returns true when a worker-reported `UpdateWithError` counts toward the
+/// worker's error-drain streak (issue #128). A worker that reports
+/// [`CONSECUTIVE_INFRA_ERROR_DRAIN_THRESHOLD`] such errors in a row, with no
+/// successfully delivered action update in between, is taken out of rotation
+/// for [`WORKER_ERROR_DRAIN_COOLDOWN_S`] seconds while its in-flight actions
+/// are allowed to finish, and then returns to rotation on its own. This
+/// error-drain state is independent of the operator-controlled admin
+/// `set_drain_worker` endpoint, which never expires.
+///
+/// Classified codes: only `Code::Internal`. Workers deliver errors here
+/// exclusively through the `InternalError` arm of `ExecuteResult` (see
+/// `nativelink-service/src/worker_api_server.rs`), and failures of the
+/// worker's own machinery (process spawn, filesystem setup, broken pipes,
+/// unexpected EOF) surface as `Internal`.
+///
+/// Honest caveat: `Internal` is NOT exclusively "this worker is broken".
+/// Worker-side I/O against shared stores also surfaces as `Internal` (for
+/// example output-upload send failures and CAS-blob copies into private
+/// inodes in `fast_slow_store.rs` / `running_actions_manager.rs`), so an
+/// outage of a shared store (S3, Redis) can push every worker's streak
+/// toward the threshold at once. The consecutive-error threshold and the
+/// self-expiring cooldown exist precisely to bound that blast radius: a
+/// single transient error never drains a worker, a fleet-wide drain during
+/// a real shared-store outage only sheds load that would fail anyway, and
+/// the fleet returns to service within one cooldown after the outage ends
+/// with no operator action.
+///
+/// Codes excluded because they describe the action rather than the worker,
+/// or already have their own handling:
+/// - `ResourceExhausted`: backpressure/shutdown signal with existing pause
+///   semantics in `update_action`; it is transient by design.
+/// - `DeadlineExceeded`: the action ran over its own timeout.
+/// - `Cancelled` / `Aborted`: the operation was killed or preempted by the
+///   scheduler.
+/// - `NotFound` / `FailedPrecondition`: missing CAS content; not a worker
+///   fault.
+/// - `Unavailable`: ambiguous between worker-local networking and shared
+///   infrastructure; excluded to keep the trigger conservative.
+const fn is_worker_infrastructure_failure(err: &Error) -> bool {
+    matches!(err.code, Code::Internal)
+}
 
 #[derive(Debug)]
 struct Workers(LruCache<WorkerId, Worker>);
@@ -129,6 +178,9 @@ struct ApiWorkerSchedulerImpl {
     /// Used to accelerate `find_worker_for_action` by filtering candidates
     /// based on properties before doing linear scan.
     capability_index: WorkerCapabilityIndex,
+
+    /// Shared scheduler metrics (also held by [`ApiWorkerScheduler`]).
+    metrics: Arc<SchedulerMetrics>,
 }
 
 impl core::fmt::Debug for ApiWorkerSchedulerImpl {
@@ -173,6 +225,18 @@ impl ApiWorkerSchedulerImpl {
             timestamp
         );
         worker.last_update_timestamp = timestamp;
+
+        // An error-drained worker returns to rotation once its keep-alives
+        // show the cooldown elapsed (issue #128). The admin-controlled
+        // `is_draining` is independent and never expires.
+        if worker.error_drained_at.is_some() && !worker.is_error_drained() {
+            worker.error_drained_at = None;
+            info!(
+                ?worker_id,
+                "Error-drain cooldown expired; worker returned to rotation"
+            );
+            self.worker_change_notify.notify_one();
+        }
 
         trace!(
             ?worker_id,
@@ -273,9 +337,10 @@ impl ApiWorkerSchedulerImpl {
             if !w.can_accept_work() {
                 if full_worker_logging {
                     info!(
-                        "Worker {worker_id} cannot accept work: is_paused={}, is_draining={}, inflight={}/{}",
+                        "Worker {worker_id} cannot accept work: is_paused={}, is_draining={}, is_error_drained={}, inflight={}/{}",
                         w.is_paused,
                         w.is_draining,
+                        w.is_error_drained(),
                         w.running_action_infos.len(),
                         w.max_inflight_tasks
                     );
@@ -333,6 +398,44 @@ impl ApiWorkerSchedulerImpl {
             );
             return Result::<(), _>::Err(err.clone())
                 .merge(self.immediate_evict_worker(worker_id, err, false).await);
+        }
+
+        // Track the worker's consecutive infrastructure-class error streak
+        // (issue #128). Only worker-reported updates flow through here, so
+        // the streak reflects what the worker itself delivered: an
+        // infrastructure-class error extends it, and any successfully
+        // delivered action update (a stage update, an action-level error
+        // such as a timeout, a per-operation keep-alive, or an
+        // execution-complete) breaks it. A disconnect carries no health
+        // signal in either direction. Note the streak deliberately survives
+        // a cooldown expiry: a worker that starts failing again right after
+        // returning to rotation is re-drained by its first error.
+        match &update {
+            UpdateOperationType::UpdateWithError(err) if is_worker_infrastructure_failure(err) => {
+                worker.consecutive_infra_errors = worker.consecutive_infra_errors.saturating_add(1);
+                if worker.consecutive_infra_errors >= CONSECUTIVE_INFRA_ERROR_DRAIN_THRESHOLD
+                    && worker.error_drained_at.is_none()
+                {
+                    worker.error_drained_at = Some(worker.last_update_timestamp);
+                    self.metrics
+                        .workers_error_drained
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        ?worker_id,
+                        %operation_id,
+                        ?err,
+                        consecutive_infra_errors = worker.consecutive_infra_errors,
+                        cooldown_s = WORKER_ERROR_DRAIN_COOLDOWN_S,
+                        "Worker reported consecutive infrastructure-class errors; \
+                         error-draining it. No new actions will be scheduled on it \
+                         until its keep-alives show the cooldown elapsed; in-flight \
+                         actions may finish. Use the admin drain endpoint for a \
+                         permanent drain."
+                    );
+                }
+            }
+            UpdateOperationType::UpdateWithDisconnect => {}
+            _ => worker.consecutive_infra_errors = 0,
         }
 
         let (is_finished, due_to_backpressure) = match &update {
@@ -513,6 +616,7 @@ impl ApiWorkerScheduler {
         worker_registry: SharedWorkerRegistry,
         maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
     ) -> Arc<Self> {
+        let metrics = Arc::new(SchedulerMetrics::default());
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
@@ -522,11 +626,12 @@ impl ApiWorkerScheduler {
                 worker_registry: worker_registry.clone(),
                 shutting_down: false,
                 capability_index: WorkerCapabilityIndex::new(),
+                metrics: metrics.clone(),
             }),
             platform_property_manager,
             worker_timeout_s,
             worker_registry,
-            metrics: Arc::new(SchedulerMetrics::default()),
+            metrics,
             maybe_origin_event_tx,
         })
     }
