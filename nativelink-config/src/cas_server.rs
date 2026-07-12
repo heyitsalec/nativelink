@@ -1000,6 +1000,19 @@ pub struct LocalWorkerConfig {
     /// action being executed of that name or the fixed value.
     pub additional_environment: Option<HashMap<String, EnvironmentSource>>,
 
+    /// Maximum number of actions this worker will execute before it stops
+    /// accepting new work and exits gracefully once all in-flight actions
+    /// have finished. Useful to guarantee a clean execution environment,
+    /// for example by setting this to 1 in a Kubernetes deployment so each
+    /// action runs in a freshly restarted pod.
+    ///
+    /// A value of 0 means unlimited: the worker never exits based on the
+    /// number of executed actions.
+    ///
+    /// Default: 0 (unlimited)
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub max_action_executions: u64,
+
     /// Optional directory cache configuration for improving performance by caching
     /// reconstructed input directories and using hardlinks instead of rebuilding
     /// them from CAS for every action.

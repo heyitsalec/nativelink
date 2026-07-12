@@ -236,6 +236,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         let actions_in_flight = Arc::new(AtomicU64::new(0));
         // Set to true when shutting down, this stops any new StartAction.
         let mut shutting_down = false;
+        // Budget of actions this worker may still accept before it stops
+        // taking new work and exits gracefully (issue #815). `None` means
+        // unlimited (`max_action_executions` of 0, the default).
+        let mut remaining_action_executions =
+            (self.config.max_action_executions > 0).then_some(self.config.max_action_executions);
+        // Resolves once the max-actions budget is exhausted and every
+        // in-flight action has finished (mirroring the signal-driven
+        // shutdown future below); `run` then returns `Ok(())`, which the
+        // outer connection loop treats as a graceful, permanent exit.
+        let mut max_actions_reached_fut = futures::future::pending::<()>().boxed().fuse();
 
         loop {
             select! {
@@ -285,6 +295,41 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             }
 
                             self.metrics.start_actions_received.inc();
+
+                            if let Some(remaining) = remaining_action_executions.as_mut() {
+                                *remaining -= 1;
+                                if *remaining == 0 {
+                                    warn!(
+                                        max_action_executions = self.config.max_action_executions,
+                                        "Accepted the last action allowed by max_action_executions; \
+                                         no further actions will be accepted and the worker will \
+                                         exit once in-flight actions finish"
+                                    );
+                                    // Any further StartAction is refused through the same
+                                    // path as a signal-driven shutdown.
+                                    shutting_down = true;
+                                    let mut grpc_client = self.grpc_client.clone();
+                                    let actions_in_flight = actions_in_flight.clone();
+                                    let actions_notify = actions_notify.clone();
+                                    max_actions_reached_fut = async move {
+                                        // Wait for in-flight operations (including the one
+                                        // accepted in this iteration; its counter increment
+                                        // happens before this future is first polled) to be
+                                        // fully completed.
+                                        while actions_in_flight.load(Ordering::Acquire) > 0 {
+                                            actions_notify.notified().await;
+                                        }
+                                        // Deregister from the scheduler. Best effort: the
+                                        // worker exits either way and the scheduler also
+                                        // notices the dropped connection.
+                                        if let Err(e) = grpc_client.going_away(GoingAwayRequest {}).await {
+                                            error!("Failed to send GoingAwayRequest: {e}",);
+                                        }
+                                    }
+                                    .boxed()
+                                    .fuse();
+                                }
+                            }
 
                             let execute_request = start_execute.execute_request.as_ref();
                             let operation_id = start_execute.operation_id.clone();
@@ -490,6 +535,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     futures.push(fut);
                 },
                 res = futures.next() => res.err_tip(|| "Keep-alive should always pending. Likely unable to send data to scheduler")??,
+                () = &mut max_actions_reached_fut => {
+                    info!(
+                        max_action_executions = self.config.max_action_executions,
+                        "Worker executed its configured max_action_executions and all \
+                         in-flight actions finished; exiting gracefully"
+                    );
+                    return Ok(());
+                },
                 complete_msg = shutdown_rx.recv().fuse() => {
                     warn!("Worker loop received shutdown signal. Shutting down worker...",);
                     let mut grpc_client = self.grpc_client.clone();
@@ -887,30 +940,36 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
             );
 
             // Now listen for connections and run all other services.
-            if let Err(err) = inner.run(update_for_worker_stream, &mut shutdown_rx).await {
-                'no_more_actions: {
-                    // Ensure there are no actions in transit before we try to kill
-                    // all our actions.
-                    const ITERATIONS: usize = 1_000;
+            // An `Ok(())` from the inner loop is only produced when the
+            // worker reached its configured `max_action_executions`
+            // (issue #815); exit for good instead of reconnecting.
+            match inner.run(update_for_worker_stream, &mut shutdown_rx).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    'no_more_actions: {
+                        // Ensure there are no actions in transit before we try to kill
+                        // all our actions.
+                        const ITERATIONS: usize = 1_000;
 
-                    const ERROR_MSG: &str = "Actions in transit did not reach zero before we disconnected from the scheduler";
+                        const ERROR_MSG: &str = "Actions in transit did not reach zero before we disconnected from the scheduler";
 
-                    let sleep_duration = ACTIONS_IN_TRANSIT_TIMEOUT_S / ITERATIONS as f32;
-                    for _ in 0..ITERATIONS {
-                        if inner.actions_in_transit.load(Ordering::Acquire) == 0 {
-                            break 'no_more_actions;
+                        let sleep_duration = ACTIONS_IN_TRANSIT_TIMEOUT_S / ITERATIONS as f32;
+                        for _ in 0..ITERATIONS {
+                            if inner.actions_in_transit.load(Ordering::Acquire) == 0 {
+                                break 'no_more_actions;
+                            }
+                            (sleep_fn_pin)(Duration::from_secs_f32(sleep_duration)).await;
                         }
-                        (sleep_fn_pin)(Duration::from_secs_f32(sleep_duration)).await;
+                        error!(ERROR_MSG);
+                        return Err(err.append(ERROR_MSG));
                     }
-                    error!(ERROR_MSG);
-                    return Err(err.append(ERROR_MSG));
-                }
-                error!(?err, "Worker disconnected from scheduler");
-                // Kill off any existing actions because if we re-connect, we'll
-                // get some more and it might resource lock us.
-                self.running_actions_manager.kill_all().await;
+                    error!(?err, "Worker disconnected from scheduler");
+                    // Kill off any existing actions because if we re-connect, we'll
+                    // get some more and it might resource lock us.
+                    self.running_actions_manager.kill_all().await;
 
-                (error_handler)(err).await; // Try to connect again.
+                    (error_handler)(err).await; // Try to connect again.
+                }
             }
         }
         // Unreachable.
