@@ -546,6 +546,44 @@ async fn ensure_empty_string_in_stream_works_test() -> Result<(), Error> {
     Ok(())
 }
 
+/// Regression test for issue #2034: a zero-digest upload must be a no-op
+/// that never reaches the ONTAP S3 backend.
+#[nativelink_test]
+async fn update_is_zero_digest() -> Result<(), Error> {
+    let digest = DigestInfo::new(Sha256::new().finalize().into(), 0);
+
+    let mock_client = StaticReplayClient::new(vec![]);
+    let test_config = Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::from_static(VSERVER_NAME))
+        .http_client(mock_client.clone())
+        .build();
+    let s3_client = aws_sdk_s3::Client::from_conf(test_config);
+    let store = OntapS3Store::new_with_client_and_jitter(
+        &(ExperimentalOntapS3Spec {
+            bucket: BUCKET_NAME.to_string(),
+            vserver_name: VSERVER_NAME.to_string(),
+            endpoint: "https://example.com".to_string(),
+            ..Default::default()
+        }),
+        s3_client,
+        Arc::new(move |_delay| Duration::from_secs(0)),
+        MockInstantWrapped::default,
+    )?;
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let (send_result, update_result) = join!(
+        async move { tx.send_eof() },
+        store.update(digest, rx, UploadSizeInfo::ExactSize(0)),
+    );
+    send_result?;
+    assert_eq!(update_result?, 0);
+
+    // No request of any kind may have been sent to the ONTAP S3 backend.
+    mock_client.assert_requests_match(&[]);
+    Ok(())
+}
+
 #[nativelink_test]
 async fn has_with_results_on_zero_digests() -> Result<(), Error> {
     let digest = DigestInfo::new(Sha256::new().finalize().into(), 0);

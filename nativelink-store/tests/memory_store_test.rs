@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use core::future::Future;
-use core::ops::RangeBounds;
+use core::ops::{Bound, RangeBounds};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -405,6 +405,43 @@ async fn get_part_is_zero_digest() -> Result<(), Error> {
 
     let empty_bytes = Bytes::new();
     assert_eq!(&file_data, &empty_bytes, "Expected file content to match");
+
+    Ok(())
+}
+
+/// Regression test for issue #2034: a zero-digest upload must not buffer or
+/// insert anything -- zero-digest existence and reads are answered without
+/// the map (see `has_with_results`/`get_part`).
+#[nativelink_test]
+async fn update_is_zero_digest_no_insert() -> Result<(), Error> {
+    let digest = DigestInfo::new(Sha256::new().finalize().into(), 0);
+    let store = MemoryStore::new(&MemorySpec::default());
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let (send_result, update_result) = futures::join!(
+        async move { tx.send_eof() },
+        store.update(digest, rx, UploadSizeInfo::ExactSize(0)),
+    );
+    send_result?;
+    assert_eq!(update_result?, 0);
+
+    // Zero-digest existence is still answered...
+    let mut results = vec![None];
+    store
+        .has_with_results(&[digest.into()], &mut results)
+        .await?;
+    assert_eq!(results, vec![Some(0)]);
+
+    // ...but nothing was inserted into the map.
+    let mut entries = 0u32;
+    let range: (Bound<StoreKey>, Bound<StoreKey>) = (Bound::Unbounded, Bound::Unbounded);
+    store
+        .list(range, &mut |_key: &StoreKey| {
+            entries += 1;
+            true
+        })
+        .await?;
+    assert_eq!(entries, 0, "Zero-digest update must not insert an entry");
 
     Ok(())
 }
