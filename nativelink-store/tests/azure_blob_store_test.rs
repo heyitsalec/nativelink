@@ -599,3 +599,37 @@ async fn test_multipart_upload_large_file() -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// Issue #441: an explicit `root_certificates` path that cannot be read must
+/// fail store construction with a diagnostic naming the CA file.
+#[nativelink_test]
+async fn azure_store_with_missing_root_certificates_errors() -> Result<(), Error> {
+    let spec = ExperimentalAzureSpec {
+        sas_url: Some("https://example.com/container?sig=fake".to_string()),
+        root_certificates: Some("/definitely/not/a/real/path.pem".to_string()),
+        ..Default::default()
+    };
+    let Err(err) = AzureBlobStore::new(&spec, MockInstantWrapped::default).await else {
+        panic!("Expected store construction to fail for a missing CA file");
+    };
+    assert!(
+        err.to_string()
+            .contains("Failed to open CA certificate file"),
+        "Unexpected error: {err}"
+    );
+    Ok(())
+}
+
+/// Issue #441: without `root_certificates` the store builds its TLS config
+/// from the platform's native trust store (no vendored webpki snapshot).
+/// Construction performs no network I/O, so this proves the native-roots
+/// path loads.
+#[nativelink_test]
+async fn azure_store_uses_native_roots_by_default() -> Result<(), Error> {
+    let spec = ExperimentalAzureSpec {
+        sas_url: Some("https://example.com/container?sig=fake".to_string()),
+        ..Default::default()
+    };
+    drop(AzureBlobStore::new(&spec, MockInstantWrapped::default).await?);
+    Ok(())
+}

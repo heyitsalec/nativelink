@@ -57,6 +57,7 @@
          "provider": "azure",
          "account_name": "cloudshell1393657559",
          "container": "simple-test-container",
+         "root_certificates": "/path/to/certs.pem",  // Optional
          "key_prefix": "folder/",
          "retry": {
              "max_retries": 6,

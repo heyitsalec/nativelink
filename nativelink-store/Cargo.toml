@@ -125,7 +125,6 @@ uuid = { version = "1.16.0", default-features = false, features = [
   "serde",
   "v4",
 ] }
-webpki-roots = { version = "1", default-features = false }
 wincode = { version = "0.5.4", default-features = false, features = [
   "alloc",
   "derive",

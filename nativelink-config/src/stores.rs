@@ -143,6 +143,7 @@ pub enum StoreSpec {
     ///     "provider": "azure",
     ///     "account_name": "cloudshell1393657559",
     ///     "container": "simple-test-container",
+    ///     "root_certificates": "/path/to/certs.pem",  // Optional
     ///     "key_prefix": "folder/",
     ///     "retry": {
     ///         "max_retries": 6,
@@ -1215,6 +1216,15 @@ pub struct ExperimentalAzureSpec {
     /// and `endpoint` are ignored for URL construction.
     #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
     pub sas_url: Option<String>,
+
+    /// Optional path to a PEM bundle of CA certificates to trust for TLS
+    /// connections to the Azure endpoint, instead of the platform's native
+    /// certificate store. Useful behind TLS-intercepting proxies or against
+    /// self-hosted emulators with self-signed certificates.
+    ///
+    /// Default: unset (trust the platform's native certificate store).
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub root_certificates: Option<String>,
 
     /// Common retry and upload configuration.
     #[serde(flatten)]

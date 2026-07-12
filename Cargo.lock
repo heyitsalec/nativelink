@@ -3244,7 +3244,6 @@ dependencies = [
  "tracing-test",
  "url",
  "uuid",
- "webpki-roots 1.0.3",
  "wincode",
  "zip",
 ]

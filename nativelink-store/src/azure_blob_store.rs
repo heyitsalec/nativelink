@@ -31,6 +31,7 @@ use azure_storage_blob::models::{
 use futures::future::FusedFuture;
 use futures::stream::{FuturesUnordered, unfold};
 use futures::{FutureExt, StreamExt, TryStreamExt};
+use hyper_rustls::ConfigBuilderExt;
 use nativelink_config::stores::ExperimentalAzureSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
@@ -50,6 +51,7 @@ use tracing::{Level, event};
 
 use crate::cas_utils::is_zero_digest;
 use crate::common_s3_utils::install_default_rustls_crypto_provider;
+use crate::ontap_s3_store::load_custom_certs;
 
 // Check the below doc for the limits specific to Azure.
 // https://learn.microsoft.com/en-us/azure/storage/blobs/scalability-targets#scale-targets-for-blob-storage
@@ -118,7 +120,9 @@ where
         let mut options = BlobContainerClientOptions::default();
         options.client_options.retry = RetryOptions::none();
         // Hand the SDK an HTTP client with an explicit rustls (ring) config.
-        options.client_options.transport = Some(Self::build_http_transport()?);
+        options.client_options.transport = Some(Self::build_http_transport(
+            spec.root_certificates.as_deref(),
+        )?);
 
         let (container_url, credential): (Url, Option<Arc<dyn TokenCredential>>) =
             if let Some(sas_url) = spec.sas_url.as_ref() {
@@ -160,14 +164,21 @@ where
     /// Builds an HTTP transport for the Azure SDK backed by a reqwest client with
     /// an explicit rustls config using `NativeLink`'s ring crypto provider, so the
     /// SDK never falls back to guessing a provider (which breaks HTTPS here).
-    fn build_http_transport() -> Result<Transport, Error> {
+    ///
+    /// Trust roots come from the platform's native certificate store by
+    /// default, or from the PEM bundle at `root_certificates` when set,
+    /// mirroring `OntapS3Store` (issue #441). Previously a vendored
+    /// `webpki-roots` snapshot was hardcoded here.
+    fn build_http_transport(root_certificates: Option<&str>) -> Result<Transport, Error> {
         install_default_rustls_crypto_provider();
 
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let tls_config = if let Some(cert_path) = root_certificates {
+            load_custom_certs(cert_path)?.as_ref().clone()
+        } else {
+            rustls::ClientConfig::builder()
+                .with_native_roots()?
+                .with_no_client_auth()
+        };
 
         let client = reqwest::Client::builder()
             .use_preconfigured_tls(tls_config)
