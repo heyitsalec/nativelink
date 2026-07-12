@@ -4,9 +4,9 @@ description: Deploy NativeLink on Kubernetes — what each workload looks like, 
 ---
 
 NativeLink ships with a reference Kubernetes deployment in the
-[`deployment-examples/kubernetes/`](https://github.com/TraceMachina/nativelink/tree/main/deployment-examples/kubernetes)
-directory. This page covers the shape; the chart there has the
-manifests.
+[`deploy/kubernetes-example/`](https://github.com/TraceMachina/nativelink/tree/main/deploy/kubernetes-example)
+directory. This page covers the shape; the Kustomize example there
+has the manifests.
 
 ## Workload layout
 
@@ -125,15 +125,21 @@ spec:
     - type: External
       external:
         metric:
-          name: nativelink_scheduler_queue_depth
+          name: nativelink_execution_active_count
+          selector:
+            matchLabels:
+              execution_stage: queued
         target:
           type: Value
           averageValue: "20"
 ```
 
-Scale on `nativelink_scheduler_queue_depth` — the Prometheus metric
-the scheduler exports. Plain CPU-based scaling doesn't react fast
-enough; workers spend most of their time blocked on I/O.
+Scale on `nativelink_execution_active_count{execution_stage="queued"}`
+— NativeLink exports it over OTLP, so surface it to the HPA by letting
+Prometheus scrape your OpenTelemetry Collector and running an
+external-metrics adapter (prometheus-adapter or KEDA) on top. Plain
+CPU-based scaling doesn't react fast enough; workers spend most of
+their time blocked on I/O.
 
 ## Service & Ingress
 
@@ -159,17 +165,16 @@ Make sure the Ingress controller supports gRPC end-to-end (NGINX with
 
 ## A complete reference
 
-The
-[`deployment-examples/kubernetes/`](https://github.com/TraceMachina/nativelink/tree/main/deployment-examples/kubernetes)
-directory in the source tree has:
+Two directories in the source tree have working material:
 
-- A Helm chart with values for dev / staging / prod.
-- A Kustomize overlay set.
-- An example `prometheus-rules.yaml` covering the alerts we run.
-- A working HPA on queue depth (the `keda` adapter is included for
-  installations using it).
+- [`deploy/kubernetes-example/`](https://github.com/TraceMachina/nativelink/tree/main/deploy/kubernetes-example)
+  — a Kustomize deployment with a ready-to-edit NativeLink config.
+- [`deployment-examples/metrics/`](https://github.com/TraceMachina/nativelink/tree/main/deployment-examples/metrics)
+  — the observability stack: OpenTelemetry Collector and Prometheus
+  manifests for Kubernetes, Prometheus recording rules (including the
+  queue-depth series above), and an `alertmanager-config.yml`.
 
-Clone the repo, point at your cluster, `helm install`. Tune from
+Clone the repo, point at your cluster, `kubectl apply -k`. Tune from
 there.
 
 ## What's next
