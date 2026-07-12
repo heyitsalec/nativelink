@@ -1,6 +1,6 @@
 ---
 title: Other build systems
-description: Use NativeLink without Bazel — Buck2, Siso, Pants, BuildStream, and CMake with recc.
+description: Use NativeLink without Bazel — Buck2, Siso, Pants, BuildStream, CMake with recc, and a migration path from icecream.
 ---
 
 NativeLink speaks the standard Remote Execution API. If your build tool
@@ -21,6 +21,9 @@ your build files.
 - [CMake with recc](/getting-started/other-build-systems/cmake-recc) —
   wrap CMake compile actions with `recc` and share compile outputs
   through NativeLink.
+- [Coming from icecream](/getting-started/other-build-systems/icecream) —
+  map an icecream compile cluster onto NativeLink: native workers
+  replace `iceccd`, the NativeLink scheduler replaces `icecc-scheduler`.
 
 ## Common NativeLink endpoint
 

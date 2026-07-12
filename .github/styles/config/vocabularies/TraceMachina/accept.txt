@@ -296,3 +296,6 @@ shellexpand
 pluggable
 [Cc]allout
 hostnames
+[Ii]cecream
+iceccd
+icecc-scheduler

@@ -1,0 +1,136 @@
+---
+title: "Coming from icecream"
+description: "Map an icecream compile cluster onto NativeLink: native workers replace iceccd, the NativeLink scheduler replaces icecc-scheduler."
+pagefind: true
+---
+
+*Read time: ~5 minutes. Hands-on time: ~10 to bring up a scheduler and
+worker on one machine.*
+
+[Icecream](https://github.com/icecc/icecream) distributes compile jobs
+for legacy build systems: one machine runs `icecc-scheduler`, every
+build machine runs the `iceccd` daemon, and clients opt in by putting
+the icecream symlink directory first on `PATH`
+(`export PATH=/usr/lib/icecc/bin:$PATH`) so that `clang`, `gcc`, and
+friends are intercepted — then keep building with `make -j <num>` as
+usual.
+
+NativeLink supports the same shape of deployment without Kubernetes:
+plain processes on the machines you already have. The mapping:
+
+| icecream | NativeLink |
+| --- | --- |
+| `icecc-scheduler -d` on one node | The NativeLink scheduler (part of one `nativelink` process) |
+| `iceccd -d` on each build machine | A NativeLink native worker (another `nativelink` process) |
+| `PATH` symlinks intercepting `clang` / `gcc` | A Remote Execution API client such as [`recc`](https://buildgrid.gitlab.io/recc) wrapping the compiler |
+
+NativeLink also gives you a content-addressed store and action cache,
+so a compile that any machine has already done — on any branch, by any
+teammate — is served from cache instead of being run again.
+
+## Prerequisites
+
+- The `nativelink` binary — the [setup guide](/getting-started/setup)
+  covers the container image and the Nix build.
+- A C/C++ project — the walkthrough below wires up CMake; any build
+  that lets you prefix individual compile commands works too.
+- [`recc`](https://buildgrid.gitlab.io/recc) on client machines — the
+  [CMake with recc](/getting-started/other-build-systems/cmake-recc)
+  page walks through installing it.
+
+## 1. Start a scheduler and worker on one machine
+
+The stock example config runs everything an icecream setup needs in a
+single process: the scheduler, one native worker, and the
+content-addressed store.
+
+```sh
+curl -O https://raw.githubusercontent.com/TraceMachina/nativelink/main/nativelink-config/examples/basic_cas.json5
+
+nativelink basic_cas.json5
+```
+
+That process now serves two endpoints:
+
+- `0.0.0.0:50051` — the public API your build clients talk to (CAS,
+  Action Cache, execution, capabilities), with instance names `""` and
+  `"main"`.
+- `0.0.0.0:50061` — the private worker API that workers connect to,
+  the way `iceccd` connected to `icecc-scheduler`.
+
+## 2. Wire up your compilers
+
+Instead of `PATH` symlinks, wrap the compiler with `recc`, a small
+Remote Execution v2 client. Point it at the scheduler node:
+
+```sh
+export RECC_SERVER=localhost:50051
+export RECC_INSTANCE=main
+```
+
+Then launch compiles through it — for CMake:
+
+```sh
+RECC=$(command -v recc)
+
+cmake -B build -S . \
+  -DCMAKE_C_COMPILER_LAUNCHER=$RECC \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=$RECC
+
+cmake --build build -j "$(nproc)"
+```
+
+For builds that aren't CMake-driven, `recc` wraps individual compile
+commands directly — this is the form its own docs show:
+
+```sh
+recc /usr/bin/gcc -c hello.c -o hello.o
+```
+
+`recc` only handles compile commands (the `-c` matters); anything it
+doesn't recognize as a compile runs locally as-is.
+
+The [CMake with recc](/getting-started/other-build-systems/cmake-recc)
+tutorial covers the remaining `RECC_*` options — including the
+cache-only mode that is the least surprising first step — and how to
+confirm cache hits.
+
+## 3. Turn your iceccd fleet into workers
+
+Each machine that used to run `iceccd` runs its own `nativelink`
+process with a worker config. The piece that ties a worker to the
+scheduler is the worker API endpoint — in `basic_cas.json5` it points
+at the same machine:
+
+```json5
+        worker_api_endpoint: {
+          uri: "grpc://127.0.0.1:50061",
+        },
+```
+
+On a separate worker machine, run the same example config with that
+URI set to your scheduler node (`grpc://<scheduler-host>:50061`)
+instead. The config also starts a local scheduler and API listeners on
+each machine — they sit unused, and trimming them is a reasonable
+exercise once you're comfortable with the
+[config format](/configuration/intro); only the worker block does the
+work on these machines. If your build machines have RAM to spare,
+[`nativelink-config/examples/tmpfs-worker.json5`](https://github.com/TraceMachina/nativelink/tree/main/nativelink-config/examples/tmpfs-worker.json5)
+is the same shape with the worker's stores and sandbox directory on
+`tmpfs` — its header comments walk through the mount setup and the
+trade-offs.
+
+One difference from icecream to know about: the scheduler matches jobs
+to workers by platform properties. The example worker advertises
+values like `cpu_arch: x86_64` and `ISA: x86-64`; if a remote action
+never gets picked up, compare the properties your client requests with
+what your workers advertise.
+
+## Going further
+
+- [On-prem deployment](/getting-started/on-prem) — hardware sizing,
+  TLS, and backups for the fleet.
+- [Production configurations](/configuration/production) — durable,
+  shared stores once the single-node cache is outgrown.
+- [Configuration introduction](/configuration/intro) — what else is
+  in that JSON5 file.
