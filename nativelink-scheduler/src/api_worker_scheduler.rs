@@ -105,6 +105,40 @@ impl MetricsComponent for Workers {
     }
 }
 
+/// Minimum interval between "no worker can satisfy this action" warnings.
+/// An unmatchable action is retried by every matching cycle, so without a
+/// rate limit the warning would be emitted for every queued unmatchable
+/// action on every cycle.
+const UNMATCHABLE_ACTION_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Outcome of a single attempt to match an action to a worker.
+///
+/// Distinguishing "every capable worker is busy" from "no connected worker
+/// could ever run this" is what lets the scheduler diagnose actions that
+/// would otherwise hang in the queue silently forever (see issue #1731),
+/// for example a client submitting a host (macOS) platform configuration
+/// to a fleet of Linux workers.
+#[derive(Debug)]
+enum FindWorkerResult {
+    /// A worker was found for the action.
+    Found(WorkerId),
+    /// At least one connected worker's static platform properties satisfy
+    /// the action, but none currently has capacity (paused, draining, at
+    /// its inflight limit, or with depleted `Minimum` resources).
+    NoCapacity,
+    /// No connected worker's static platform properties can satisfy the
+    /// action regardless of load (this includes an empty worker pool). The
+    /// action cannot be scheduled until a matching worker connects.
+    ///
+    /// Note: only `Exact`/`Unknown` property mismatches and missing
+    /// property keys are detected. A `Minimum` property whose requested
+    /// value exceeds what any worker could ever offer is reported as
+    /// [`Self::NoCapacity`], because `Minimum` values deplete dynamically
+    /// as actions run and "temporarily depleted" cannot be told apart from
+    /// "never enough" at this layer.
+    NoCapableWorker,
+}
+
 /// A collection of workers that are available to run tasks.
 #[derive(MetricsComponent)]
 struct ApiWorkerSchedulerImpl {
@@ -243,13 +277,23 @@ impl ApiWorkerSchedulerImpl {
         &self,
         platform_properties: &PlatformProperties,
         full_worker_logging: bool,
-    ) -> Option<WorkerId> {
+    ) -> FindWorkerResult {
         // Do a fast check to see if any workers are available at all for work allocation
         if !self.workers.iter().any(|(_, w)| w.can_accept_work()) {
             if full_worker_logging {
                 info!("All workers are fully allocated");
             }
-            return None;
+            // Even with a fully allocated pool, classify whether any
+            // connected worker could ever satisfy the action, so that
+            // unmatchable actions are still diagnosed (issue #1731).
+            if self
+                .capability_index
+                .find_matching_workers(platform_properties, full_worker_logging)
+                .is_empty()
+            {
+                return FindWorkerResult::NoCapableWorker;
+            }
+            return FindWorkerResult::NoCapacity;
         }
 
         // Use capability index to get candidate workers that match STATIC properties
@@ -263,7 +307,7 @@ impl ApiWorkerSchedulerImpl {
             if full_worker_logging {
                 info!("No workers in capability index match required properties");
             }
-            return None;
+            return FindWorkerResult::NoCapableWorker;
         }
 
         // Check function for availability AND dynamic Minimum property verification.
@@ -312,7 +356,7 @@ impl ApiWorkerSchedulerImpl {
         if full_worker_logging && worker_id.is_none() {
             warn!("No workers matched!");
         }
-        worker_id
+        worker_id.map_or(FindWorkerResult::NoCapacity, FindWorkerResult::Found)
     }
 
     async fn update_action(
@@ -501,6 +545,10 @@ pub struct ApiWorkerScheduler {
     /// Channel for publishing origin events such as worker-observed action
     /// resource usage. `None` when origin events are disabled.
     maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
+
+    /// When the last "no worker can satisfy this action" warning was
+    /// emitted, for rate limiting. See issue #1731.
+    last_unmatchable_warn: parking_lot::Mutex<Option<Instant>>,
 }
 
 impl ApiWorkerScheduler {
@@ -528,6 +576,7 @@ impl ApiWorkerScheduler {
             worker_registry,
             metrics: Arc::new(SchedulerMetrics::default()),
             maybe_origin_event_tx,
+            last_unmatchable_warn: parking_lot::Mutex::new(None),
         })
     }
 
@@ -570,6 +619,47 @@ impl ApiWorkerScheduler {
         &self.metrics
     }
 
+    /// Emits a rate-limited warning that an action's platform properties
+    /// cannot be satisfied by any connected worker, including the requested
+    /// properties and a bounded sample of connected workers' properties so
+    /// the mismatch is diagnosable from the log line alone (issue #1731).
+    fn maybe_warn_unmatchable_action(
+        &self,
+        inner: &ApiWorkerSchedulerImpl,
+        requested_properties: &PlatformProperties,
+    ) {
+        const MAX_WORKER_SAMPLE: usize = 3;
+        {
+            let mut last_warn = self.last_unmatchable_warn.lock();
+            let now = Instant::now();
+            if let Some(last) = *last_warn
+                && now.duration_since(last) < UNMATCHABLE_ACTION_WARN_INTERVAL
+            {
+                return;
+            }
+            *last_warn = Some(now);
+        }
+
+        let worker_properties_sample: Vec<String> = inner
+            .workers
+            .iter()
+            .take(MAX_WORKER_SAMPLE)
+            .map(|(worker_id, worker)| {
+                format!("{worker_id}: {:?}", worker.platform_properties.properties)
+            })
+            .collect();
+        warn!(
+            requested_properties = ?requested_properties.properties,
+            connected_workers = inner.workers.len(),
+            ?worker_properties_sample,
+            "No connected worker can satisfy this action's platform properties; \
+             the action stays queued until a matching worker connects. This \
+             usually means the client's platform configuration does not match \
+             the worker fleet (for example running a `remote` runner with a \
+             host platform configuration). This warning is rate-limited."
+        );
+    }
+
     /// Attempts to find a worker that is capable of running this action.
     // TODO(palfrey) This algorithm is not very efficient. Simple testing using a tree-like
     // structure showed worse performance on a 10_000 worker * 7 properties * 1000 queued tasks
@@ -586,12 +676,22 @@ impl ApiWorkerScheduler {
 
         let inner = self.inner.lock().await;
         let worker_count = inner.workers.len() as u64;
-        let result = inner.inner_find_worker_for_action(platform_properties, full_worker_logging);
+        let find_result =
+            inner.inner_find_worker_for_action(platform_properties, full_worker_logging);
 
         // Track workers iterated (worst case is all workers)
         self.metrics
             .workers_iterated
             .fetch_add(worker_count, Ordering::Relaxed);
+
+        let result = match find_result {
+            FindWorkerResult::Found(worker_id) => Some(worker_id),
+            FindWorkerResult::NoCapacity => None,
+            FindWorkerResult::NoCapableWorker => {
+                self.maybe_warn_unmatchable_action(&inner, platform_properties);
+                None
+            }
+        };
 
         if result.is_some() {
             self.metrics
