@@ -32,7 +32,7 @@ use nativelink_util::store_trait::{
     RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use parking_lot::Mutex;
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 
 #[derive(Clone, Debug)]
 struct ExistenceItem(u64);
@@ -78,7 +78,13 @@ impl<I: InstantWrapper> RemoveItemCallback for ExistenceCacheStore<I> {
         Box::pin(async move {
             let deleted_key = self.existence_cache.remove(&digest).await;
             if !deleted_key {
-                info!(?store_key, "Failed to delete key from cache on callback");
+                // Benign: the existence cache is populated lazily and has its
+                // own eviction policy, so the inner store often removes keys
+                // that were never (or are no longer) in this cache.
+                debug!(
+                    ?store_key,
+                    "Key not present in existence cache during removal callback"
+                );
             }
         })
     }

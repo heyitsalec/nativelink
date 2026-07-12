@@ -154,6 +154,46 @@ async fn ensure_has_requests_do_let_evictions_happen() -> Result<(), Error> {
     Ok(())
 }
 
+// Regression test for https://github.com/TraceMachina/nativelink/issues/2009.
+// The inner store fires the remove callback for every removal/eviction, and
+// the removed key legitimately may never have been in the existence cache.
+// That benign case must be logged at debug level, not as an INFO failure.
+#[nativelink_test]
+async fn existence_cache_uncached_removal_callback_logs_at_debug() -> Result<(), Error> {
+    const VALUE: &str = "123";
+    let inner_store = MemoryStore::new(&MemorySpec::default());
+    let digest = DigestInfo::try_new(VALID_HASH1, 3).unwrap();
+    inner_store
+        .update_oneshot(digest, VALUE.into())
+        .await
+        .err_tip(|| "Failed to update store")?;
+    let store = ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Noop(NoopSpec::default()),
+            eviction_policy: Option::default(),
+        },
+        Store::new(inner_store.clone()),
+    );
+    assert!(
+        !store.exists_in_cache(&digest).await,
+        "Expected digest to not be in the existence cache"
+    );
+
+    // The existence cache never tracked this digest, so the remove callback
+    // fires for a key that is not in the cache.
+    inner_store.remove_entry(digest.into()).await;
+
+    assert!(
+        logs_contain("Key not present in existence cache during removal callback"),
+        "Expected benign removal-callback miss to be logged at debug level"
+    );
+    assert!(
+        !logs_contain("Failed to delete key from cache on callback"),
+        "Benign removal-callback miss must not be logged as a failure"
+    );
+    Ok(())
+}
+
 #[nativelink_test]
 async fn copes_with_dropped_items() -> Result<(), Error> {
     const VALUE: &str = "123";
