@@ -19,16 +19,17 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use nativelink_config::stores::{CompressionSpec, MemorySpec, StoreSpec};
+use nativelink_config::stores::{CompressionSpec, FilesystemSpec, MemorySpec, StoreSpec};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_store::compression_store::{
     CURRENT_STREAM_FORMAT_VERSION, CompressionStore, DEFAULT_BLOCK_SIZE, FOOTER_FRAME_TYPE, Footer,
     Lz4Config, SliceIndex, WincodeConfig,
 };
+use nativelink_store::filesystem_store::FilesystemStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::buf_channel::make_buf_channel_pair;
-use nativelink_util::common::DigestInfo;
+use nativelink_util::common::{DigestInfo, make_temp_path};
 use nativelink_util::spawn;
 use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use pretty_assertions::assert_eq;
@@ -507,6 +508,72 @@ async fn get_part_is_zero_digest() -> Result<(), Error> {
     let empty_bytes = Bytes::new();
     assert_eq!(&file_data, &empty_bytes, "Expected file content to match");
 
+    Ok(())
+}
+
+// Regression test for https://github.com/TraceMachina/nativelink/issues/2542.
+// FilesystemStore (and other stores with the zero-digest fast path) short
+// circuits zero-digest uploads without ever reading from their receiver, so
+// CompressionStore must not try to write its compression header/footer to the
+// inner store, otherwise the upload fails with "receiver disconnected".
+#[nativelink_test]
+async fn update_is_zero_digest() -> Result<(), Error> {
+    let digest = DigestInfo::new(Sha256::new().finalize().into(), 0);
+
+    let inner_store = <FilesystemStore>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    })
+    .await
+    .err_tip(|| "Failed to create filesystem store")?;
+    let store_owned = CompressionStore::new(
+        &CompressionSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            compression_algorithm: nativelink_config::stores::CompressionAlgorithm::Lz4(
+                nativelink_config::stores::Lz4Config::default(),
+            ),
+        },
+        Store::new(inner_store),
+    )
+    .err_tip(|| "Failed to create compression store")?;
+    let store = Pin::new(Arc::new(store_owned));
+
+    let (mut tx, rx) = make_buf_channel_pair();
+
+    let store_clone = store.clone();
+    let update_fut = spawn!("update_is_zero_digest", async move {
+        store_clone
+            .as_ref()
+            .update(digest, rx, UploadSizeInfo::ExactSize(0))
+            .await
+    });
+    // Yield so the update (and the inner store update it may spawn, which
+    // hangs up its receiver on zero digests without reading from it) runs
+    // before the EOF arrives, like a streaming client that has not sent
+    // anything yet.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tx.send_eof()
+        .err_tip(|| "Failed to send EOF for zero byte digest")?;
+
+    let update_result = update_fut
+        .await
+        .err_tip(|| "Failed to join update spawn")?
+        .err_tip(|| "Failed to update zero byte digest in compression store")?;
+    assert_eq!(update_result, 0, "Expected zero bytes to be written");
+
+    let store_data = store
+        .as_ref()
+        .get_part_unchunked(digest, 0, None)
+        .await
+        .err_tip(|| "Failed to get zero byte digest from compression store")?;
+    assert_eq!(
+        store_data.len(),
+        0,
+        "Expected zero byte digest to round trip as empty data"
+    );
     Ok(())
 }
 

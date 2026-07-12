@@ -297,6 +297,23 @@ impl StoreDriver for CompressionStore {
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
     ) -> Result<u64, Error> {
+        if is_zero_digest(key.borrow()) {
+            let chunk = reader
+                .peek()
+                .await
+                .err_tip(|| "Failed to peek in CompressionStore::update")?;
+            if chunk.is_empty() {
+                reader
+                    .drain()
+                    .await
+                    .err_tip(|| "Failed to drain in CompressionStore::update")?;
+                // Zero-digest keys are special: inner stores may short circuit
+                // them and never read from their receiver, so we must not try
+                // to write our compression header/footer to the inner store.
+                return Ok(0);
+            }
+        }
+
         let mut output_state = UploadState::new(&self, upload_size)?;
 
         let (mut tx, rx) = make_buf_channel_pair();
