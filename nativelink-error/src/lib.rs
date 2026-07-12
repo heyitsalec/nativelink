@@ -194,11 +194,34 @@ impl Error {
 
 impl core::error::Error for Error {}
 
+/// Marker appended to every client-facing error message so users can tell
+/// which `NativeLink` version produced an error (issue #1044). Uses the same
+/// version source as `nativelink --version`; bazel builds take it from the
+/// `version` attribute on this crate's `rust_library` target.
+pub const VERSION_MESSAGE_SUFFIX: &str = concat!(" (nativelink v", env!("CARGO_PKG_VERSION"), ")");
+
+/// Appends [`VERSION_MESSAGE_SUFFIX`] to a message crossing a client-facing
+/// `Status` conversion boundary. A `contains` guard (not `ends_with`,
+/// because `From<tonic::Status> for Error` embeds the whole `Status`
+/// `Display` output, which wraps the original message) keeps proxy chains
+/// (`GrpcStore`/`GrpcScheduler` convert `Status` -> `Error` -> `Status`)
+/// from stacking duplicate markers of the same version; different versions
+/// in a proxy chain each leave their marker, which is a feature.
+fn attach_version_marker(message: &str) -> String {
+    if message.contains(VERSION_MESSAGE_SUFFIX) {
+        message.to_string()
+    } else if message.is_empty() {
+        VERSION_MESSAGE_SUFFIX.trim_start().to_string()
+    } else {
+        format!("{message}{VERSION_MESSAGE_SUFFIX}")
+    }
+}
+
 impl From<Error> for nativelink_proto::google::rpc::Status {
     fn from(val: Error) -> Self {
         Self {
             code: val.code as i32,
-            message: val.message_string(),
+            message: attach_version_marker(&val.message_string()),
             details: vec![],
         }
     }
@@ -360,7 +383,7 @@ impl From<tonic::Status> for Error {
 
 impl From<Error> for tonic::Status {
     fn from(val: Error) -> Self {
-        Self::new(val.code, val.messages.join(" : "))
+        Self::new(val.code, attach_version_marker(&val.messages.join(" : ")))
     }
 }
 
