@@ -39,6 +39,11 @@ it. Good for a 10-minute demo or a CI runner with a short lifetime.
 }
 ```
 
+Even a demo config keeps `AC_MAIN_STORE` separate from
+`CAS_MAIN_STORE` — [AC and CAS must never share a
+store](/reference/nativelink-config/store-overview#common-compositions),
+or their keys collide.
+
 Save as `basic_cas.json5`, then:
 
 ```bash

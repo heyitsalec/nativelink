@@ -96,8 +96,14 @@ front of a durable store:
 },
 ```
 
-If your AC is on the same S3 cluster as your CAS, prefix-segment them.
-S3 LIST cost matters at scale.
+Note the AC gets its own bucket. That's load-bearing: AC keys are
+action digests whose values don't hash to the key, and those same
+digests are live CAS keys, so [AC and CAS must never share a
+backend](/reference/nativelink-config/store-overview#common-compositions).
+NativeLink only catches the literal same-store-name case at startup.
+Distinct buckets — or at minimum distinct `key_prefix`es on one
+bucket — keep the key spaces disjoint, and separate buckets keep S3
+LIST costs sane at scale.
 
 ## Scheduler: HA with sticky workers
 
