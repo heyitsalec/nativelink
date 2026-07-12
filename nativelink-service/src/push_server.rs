@@ -26,9 +26,47 @@ use nativelink_util::digest_hasher::make_ctx_for_hash_func;
 use nativelink_util::store_trait::{Store, StoreLike};
 use opentelemetry::context::FutureExt;
 use tonic::{Request, Response, Status};
-use tracing::{Instrument, Level, error_span, info, instrument};
+use tracing::{Instrument, Level, error, error_span, info, instrument, warn};
 
 use crate::remote_asset_proto::RemoteAssetArtifact;
+
+/// Logs a failed RPC at a level matching who must act on it (issue #1826):
+/// request/precondition problems the CLIENT must fix log at WARN, while
+/// failures of this server or its backing infrastructure that the OPERATOR
+/// must act on log at ERROR. This replaces the blanket
+/// `err(level = ...)` that previously logged every error at one level.
+///
+/// Borderline codes, deliberately classified:
+/// - `Aborted` => WARN: a concurrency conflict the client resolves by
+///   retrying at a higher level; nothing is broken server-side.
+/// - `FailedPrecondition` => WARN: by gRPC contract the client must fix
+///   system state before retrying, so it flags a bad request sequence.
+/// - `DeadlineExceeded` => ERROR: however the deadline was chosen, this
+///   server failed to answer within it; latency on these endpoints is
+///   dominated by the backing store, making this an operator signal.
+/// - `ResourceExhausted` => ERROR: these endpoints have no per-client
+///   quota, so this code only arises from infrastructure backpressure.
+///
+/// Note: Keep in sync with the copy in `fetch_server.rs`.
+fn log_rpc_failure(rpc: &str, err: &Error) {
+    match err.code {
+        Code::Cancelled
+        | Code::InvalidArgument
+        | Code::NotFound
+        | Code::AlreadyExists
+        | Code::PermissionDenied
+        | Code::FailedPrecondition
+        | Code::Aborted
+        | Code::OutOfRange
+        | Code::Unimplemented
+        | Code::Unauthenticated => {
+            warn!(?err, "{rpc} failed with a client-side error");
+        }
+        // Unknown, DeadlineExceeded, ResourceExhausted, Internal,
+        // Unavailable and DataLoss are operator-actionable.
+        _ => error!(?err, "{rpc} failed with a server-side error"),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PushStoreInfo {
@@ -126,8 +164,7 @@ impl PushServer {
 impl Push for PushServer {
     #[allow(clippy::blocks_in_conditions)]
     #[instrument(
-        err(level = Level::WARN),
-        ret(level = Level::INFO),
+        ret(level = Level::DEBUG),
         skip_all,
         fields(request = ?grpc_request.get_ref())
     )]
@@ -137,20 +174,26 @@ impl Push for PushServer {
     ) -> Result<Response<PushBlobResponse>, Status> {
         let request = grpc_request.into_inner();
         let digest_function = request.digest_function;
-        self.inner_push_blob(request)
-            .instrument(error_span!("push_push_blob"))
-            .with_context(
-                make_ctx_for_hash_func(digest_function).err_tip(|| "In PushServer::push_blob")?,
-            )
-            .await
-            .err_tip(|| "Failed on push_blob() command")
-            .map_err(Into::into)
+        let result = async {
+            self.inner_push_blob(request)
+                .instrument(error_span!("push_push_blob"))
+                .with_context(
+                    make_ctx_for_hash_func(digest_function)
+                        .err_tip(|| "In PushServer::push_blob")?,
+                )
+                .await
+                .err_tip(|| "Failed on push_blob() command")
+        }
+        .await;
+        result.map_err(|err| {
+            log_rpc_failure("push_blob", &err);
+            err.into()
+        })
     }
 
     #[allow(clippy::blocks_in_conditions)]
     #[instrument(
-        err(level = Level::WARN),
-        ret(level = Level::INFO),
+        ret(level = Level::DEBUG),
         skip_all,
         fields(request = ?_grpc_request.get_ref())
     )]
@@ -158,6 +201,8 @@ impl Push for PushServer {
         &self,
         _grpc_request: Request<PushDirectoryRequest>,
     ) -> Result<Response<PushDirectoryResponse>, Status> {
-        Err(Status::unimplemented("PushDirectory not implemented"))
+        let err = make_err!(Code::Unimplemented, "PushDirectory not implemented");
+        log_rpc_failure("push_directory", &err);
+        Err(err.into())
     }
 }
