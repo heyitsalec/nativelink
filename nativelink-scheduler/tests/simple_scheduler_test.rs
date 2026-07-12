@@ -804,6 +804,229 @@ async fn set_drain_worker_pauses_and_resumes_worker_test() -> Result<(), Error> 
     Ok(())
 }
 
+/// Regression test for <https://github.com/TraceMachina/nativelink/issues/1731>.
+/// An action whose platform properties no connected worker can satisfy used
+/// to sit in the queue with no explanation anywhere. The scheduler now emits
+/// a rate-limited warning naming the requested properties and a sample of
+/// the connected workers' properties, while the action keeps its normal
+/// queueing semantics: it is picked up as soon as a matching worker connects.
+#[nativelink_test]
+async fn unmatchable_action_warns_and_recovers_when_worker_connects_test() -> Result<(), Error> {
+    let worker_id1 = WorkerId("worker1".to_string());
+    let worker_id2 = WorkerId("worker2".to_string());
+
+    let mut prop_defs = HashMap::new();
+    prop_defs.insert("OSFamily".to_string(), PropertyType::Exact);
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            supported_platform_properties: Some(prop_defs),
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    // The connected fleet is Linux-only.
+    let mut linux_properties = PlatformProperties::default();
+    linux_properties.properties.insert(
+        "OSFamily".to_string(),
+        PlatformPropertyValue::Exact("linux".to_string()),
+    );
+    let mut rx_from_worker1 =
+        setup_new_worker(&scheduler, worker_id1, linux_properties.clone()).await?;
+
+    // The client asks for macOS (e.g. a host platform configuration escaping
+    // to a remote runner). No connected worker can ever satisfy this.
+    let mut macos_properties = HashMap::new();
+    macos_properties.insert("OSFamily".to_string(), "macos".to_string());
+
+    let mut action1_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([99u8; 32], 512),
+        macos_properties.clone(),
+        make_system_time(1),
+    )
+    .await?;
+    assert_eq!(
+        action1_listener.changed().await.unwrap().0.stage,
+        ActionStage::Queued
+    );
+    // Force a full matching cycle so the diagnostic does not depend on the
+    // background matching task having been polled.
+    scheduler.do_try_match_for_test().await?;
+    assert!(logs_contain(
+        "No connected worker can satisfy this action's platform properties"
+    ));
+
+    // A second unmatchable action within the rate-limit interval must not
+    // produce a second warning, no matter how many matching cycles ran.
+    let mut action2_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([98u8; 32], 512),
+        macos_properties,
+        make_system_time(2),
+    )
+    .await?;
+    assert_eq!(
+        action2_listener.changed().await.unwrap().0.stage,
+        ActionStage::Queued
+    );
+    // Both unmatchable actions fail to match again in these cycles; the
+    // rate limit must still keep it to a single warning.
+    scheduler.do_try_match_for_test().await?;
+    scheduler.do_try_match_for_test().await?;
+    logs_assert(|lines: &[&str]| {
+        match lines
+            .iter()
+            .filter(|line| {
+                line.contains("No connected worker can satisfy this action's platform properties")
+            })
+            .count()
+        {
+            1 => Ok(()),
+            n => Err(format!("Expected exactly 1 rate-limited warning, got {n}")),
+        }
+    });
+
+    // The warning is diagnostic only: when a matching worker connects, the
+    // queued actions are scheduled onto it as before.
+    let mut macos_worker_properties = PlatformProperties::default();
+    macos_worker_properties.properties.insert(
+        "OSFamily".to_string(),
+        PlatformPropertyValue::Exact("macos".to_string()),
+    );
+    let mut rx_from_worker2 =
+        setup_new_worker(&scheduler, worker_id2, macos_worker_properties).await?;
+    match rx_from_worker2.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+    match rx_from_worker2.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+    assert_eq!(
+        action1_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+    assert_eq!(
+        action2_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+    // The Linux worker never received anything.
+    assert!(matches!(
+        rx_from_worker1.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    Ok(())
+}
+
+/// Counterpart to the issue #1731 diagnostic: a pool that is merely
+/// saturated (capable workers exist, but none has capacity) is a normal
+/// backlog situation and must NOT produce the "no connected worker can
+/// satisfy" warning.
+#[nativelink_test]
+async fn saturated_capable_pool_does_not_warn_unmatchable_test() -> Result<(), Error> {
+    let worker_id = WorkerId("worker1".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+
+    // A worker that can run at most one action at a time.
+    let (tx, mut rx_from_worker) = mpsc::unbounded_channel();
+    scheduler
+        .add_worker(Worker::new(
+            worker_id.clone(),
+            PlatformProperties::default(),
+            tx,
+            NOW_TIME,
+            1,
+        ))
+        .await
+        .err_tip(|| "Failed to add worker")?;
+    tokio::task::yield_now().await; // Allow task<->worker matcher to run.
+    verify_initial_connection_message(worker_id.clone(), &mut rx_from_worker).await;
+
+    // First action fills the worker to its inflight limit.
+    let mut action1_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([99u8; 32], 512),
+        HashMap::new(),
+        make_system_time(1),
+    )
+    .await?;
+    let operation_id = match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(exec)) => OperationId::from(exec.operation_id),
+        v => panic!("Expected StartAction, got : {v:?}"),
+    };
+    assert_eq!(
+        action1_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    // Second action has to wait: the pool is saturated but perfectly
+    // capable, so there must be no "unmatchable" warning.
+    let mut action2_listener = setup_action(
+        &scheduler,
+        DigestInfo::new([88u8; 32], 512),
+        HashMap::new(),
+        make_system_time(2),
+    )
+    .await?;
+    assert_eq!(
+        action2_listener.changed().await.unwrap().0.stage,
+        ActionStage::Queued
+    );
+    // Force a matching cycle so the absence of the warning is meaningful.
+    scheduler.do_try_match_for_test().await?;
+    assert!(!logs_contain(
+        "No connected worker can satisfy this action's platform properties"
+    ));
+
+    // Once capacity frees up the queued action is dispatched normally.
+    scheduler
+        .update_action(
+            &worker_id,
+            &operation_id,
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ActionResult {
+                exit_code: 0,
+                ..ActionResult::default()
+            })),
+        )
+        .await?;
+    match rx_from_worker.recv().await.unwrap().update {
+        Some(update_for_worker::Update::StartAction(_)) => { /* Success */ }
+        v => panic!("Expected StartAction, got : {v:?}"),
+    }
+    assert_eq!(
+        action2_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn worker_should_not_queue_if_properties_dont_match_test() -> Result<(), Error> {
     let worker_id1 = WorkerId("worker1".to_string());
