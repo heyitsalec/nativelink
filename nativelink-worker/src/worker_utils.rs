@@ -25,6 +25,26 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use tokio::process;
 use tracing::{info, warn};
 
+/// The `NativeLink` version of this build, exchanged between workers and
+/// schedulers to detect mismatched deployments. This is the same source
+/// that `nativelink --version` reports. Note: bazel builds that do not
+/// stamp a version report the `rules_rust` placeholder "0.0.0", which
+/// [`is_version_mismatch`] treats as unknown.
+pub const NATIVELINK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Returns true when `own` and `peer` are both known `NativeLink` versions
+/// that differ. An empty version (for example a peer that predates version
+/// reporting) or the "0.0.0" placeholder of unstamped bazel builds is
+/// treated as unknown and never reported as a mismatch.
+/// Note: Keep in sync with the copy in `nativelink-scheduler/src/worker.rs`.
+pub fn is_version_mismatch(own: &str, peer: &str) -> bool {
+    const UNKNOWN_VERSION: &str = "0.0.0";
+    if own.is_empty() || own == UNKNOWN_VERSION || peer.is_empty() || peer == UNKNOWN_VERSION {
+        return false;
+    }
+    own != peer
+}
+
 #[expect(clippy::future_not_send)] // TODO(jhpratt) remove this
 pub async fn make_connect_worker_request<S: BuildHasher>(
     worker_id_prefix: String,
@@ -105,5 +125,6 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
         worker_id_prefix,
         properties: try_join_all(futures).await?.into_iter().flatten().collect(),
         max_inflight_tasks,
+        version: NATIVELINK_VERSION.to_string(),
     })
 }

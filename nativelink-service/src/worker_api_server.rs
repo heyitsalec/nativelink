@@ -30,7 +30,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     execute_result, ExecuteComplete, ExecuteResult, GoingAwayRequest, KeepAliveRequest, UpdateForScheduler, UpdateForWorker
 };
-use nativelink_scheduler::worker::Worker;
+use nativelink_scheduler::worker::{is_version_mismatch, Worker, NATIVELINK_VERSION};
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::background_spawn;
 use nativelink_util::action_messages::{OperationId, WorkerId};
@@ -160,6 +160,14 @@ impl WorkerApiServer {
             ));
         };
 
+        if is_version_mismatch(NATIVELINK_VERSION, &connect_worker_request.version) {
+            warn!(
+                scheduler_version = NATIVELINK_VERSION,
+                worker_version = %connect_worker_request.version,
+                "Worker is running a different NativeLink version than the scheduler. Mismatched versions may cause unexpected API errors, consider aligning them.",
+            );
+        }
+
         let (tx, rx) = mpsc::unbounded_channel();
 
         // First convert our proto platform properties into one our scheduler understands.
@@ -185,13 +193,14 @@ impl WorkerApiServer {
                 connect_worker_request.worker_id_prefix,
                 Uuid::now_v6(&self.node_id).hyphenated()
             ));
-            let worker = Worker::new(
+            let mut worker = Worker::new(
                 worker_id.clone(),
                 platform_properties,
                 tx,
                 (self.now_fn)()?.as_secs(),
                 connect_worker_request.max_inflight_tasks,
             );
+            worker.version = connect_worker_request.version.clone();
             self.scheduler
                 .add_worker(worker)
                 .await

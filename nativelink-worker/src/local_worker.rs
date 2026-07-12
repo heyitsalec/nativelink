@@ -55,7 +55,7 @@ use crate::running_actions_manager::{
     RunningActionsManager, RunningActionsManagerArgs, RunningActionsManagerImpl,
 };
 use crate::worker_api_client_wrapper::{WorkerApiClientTrait, WorkerApiClientWrapper};
-use crate::worker_utils::make_connect_worker_request;
+use crate::worker_utils::{NATIVELINK_VERSION, is_version_mismatch, make_connect_worker_request};
 
 /// Amount of time to wait if we have actions in transit before we try to
 /// consider an error to have occurred.
@@ -818,7 +818,16 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
             .update;
 
         let worker_id = match first_msg_update {
-            Some(Update::ConnectionResult(connection_result)) => connection_result.worker_id,
+            Some(Update::ConnectionResult(connection_result)) => {
+                if is_version_mismatch(NATIVELINK_VERSION, &connection_result.version) {
+                    warn!(
+                        worker_version = NATIVELINK_VERSION,
+                        scheduler_version = %connection_result.version,
+                        "Scheduler is running a different NativeLink version than this worker. Mismatched versions may cause unexpected API errors, consider aligning them.",
+                    );
+                }
+                connection_result.worker_id
+            }
             other => {
                 return Err(make_input_err!(
                     "Expected first response from scheduler to be a ConnectionResult got : {:?}",

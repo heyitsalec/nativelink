@@ -56,6 +56,7 @@ use nativelink_util::store_trait::Store;
 use nativelink_worker::local_worker::new_local_worker;
 #[cfg(target_family = "unix")]
 use nativelink_worker::local_worker::preconditions_met;
+use nativelink_worker::worker_utils::{NATIVELINK_VERSION, is_version_mismatch};
 use pretty_assertions::assert_eq;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
@@ -118,6 +119,7 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
                 }
             ],
             max_inflight_tasks: 0,
+            version: NATIVELINK_VERSION.to_string(),
         }
     );
 
@@ -135,7 +137,13 @@ async fn reconnect_on_server_disconnect_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_eq!(
+            props,
+            ConnectWorkerRequest {
+                version: NATIVELINK_VERSION.to_string(),
+                ..Default::default()
+            }
+        );
     }
 
     // Disconnect our grpc stream.
@@ -148,8 +156,169 @@ async fn reconnect_on_server_disconnect_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_eq!(
+            props,
+            ConnectWorkerRequest {
+                version: NATIVELINK_VERSION.to_string(),
+                ..Default::default()
+            }
+        );
     }
+
+    Ok(())
+}
+
+// Regression tests for https://github.com/TraceMachina/nativelink/issues/1253:
+// the worker announces its NativeLink version when connecting and warns when
+// the scheduler reports a different (known) version.
+#[nativelink_test]
+async fn version_mismatch_from_scheduler_logs_warning_test() -> Result<(), Error> {
+    const WARNING_MSG: &str = "Scheduler is running a different NativeLink version";
+
+    // The mismatch rule itself, mirrored on the scheduler side: only two
+    // known-but-different versions are a mismatch. Unknown versions (old
+    // peers that send nothing, or the "0.0.0" placeholder of unstamped
+    // bazel builds) never warn.
+    assert!(is_version_mismatch("1.0.0", "1.0.1"));
+    assert!(!is_version_mismatch("1.0.0", "1.0.0"));
+    assert!(!is_version_mismatch("1.0.0", ""));
+    assert!(!is_version_mismatch("", "1.0.1"));
+    assert!(!is_version_mismatch("1.0.0", "0.0.0"));
+    assert!(!is_version_mismatch("0.0.0", "1.0.1"));
+
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        // The worker must announce its own version when connecting.
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_eq!(props.version, NATIVELINK_VERSION);
+    }
+
+    // Register with a scheduler that reports a different version.
+    let mismatched_version = format!("{NATIVELINK_VERSION}-mismatch");
+    {
+        let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: "foobar".to_string(),
+                        version: mismatched_version.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+        // Disconnect so the worker reconnects below, proving the
+        // ConnectionResult above was fully processed.
+        drop(tx_stream);
+    }
+
+    {
+        // A mismatched version must never prevent the connection; the worker
+        // carries on and reconnects after the disconnect above.
+        let (_, streaming_response) = setup_grpc_stream();
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_eq!(props.version, NATIVELINK_VERSION);
+    }
+
+    if is_version_mismatch(NATIVELINK_VERSION, &mismatched_version) {
+        assert!(
+            logs_contain(WARNING_MSG),
+            "Expected a warning for the mismatched scheduler version"
+        );
+    } else {
+        // Our own version is unknown (unstamped build), so even a differing
+        // scheduler version must stay quiet.
+        assert!(
+            !logs_contain(WARNING_MSG),
+            "Unknown own version must not warn"
+        );
+    }
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn matching_or_unknown_scheduler_version_logs_no_warning_test() -> Result<(), Error> {
+    const WARNING_MSG: &str = "Scheduler is running a different NativeLink version";
+
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+    drop(
+        test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await,
+    );
+
+    // A scheduler that reports the same version must not warn.
+    {
+        let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: "foobar".to_string(),
+                        version: NATIVELINK_VERSION.to_string(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+        drop(tx_stream);
+    }
+
+    // An old scheduler that does not report a version must still connect
+    // without a warning.
+    {
+        let (tx_stream, streaming_response) = setup_grpc_stream();
+        drop(
+            test_context
+                .client
+                .expect_connect_worker(Ok(streaming_response))
+                .await,
+        );
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: "foobar".to_string(),
+                        ..Default::default()
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+        drop(tx_stream);
+    }
+
+    {
+        // Sync point: the worker reconnects again after the second
+        // disconnect, proving both ConnectionResults were processed.
+        let (_, streaming_response) = setup_grpc_stream();
+        drop(
+            test_context
+                .client
+                .expect_connect_worker(Ok(streaming_response))
+                .await,
+        );
+    }
+
+    assert!(
+        !logs_contain(WARNING_MSG),
+        "Matching or missing scheduler versions must not warn"
+    );
 
     Ok(())
 }
@@ -165,7 +334,13 @@ async fn kill_all_called_on_disconnect() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_eq!(
+            props,
+            ConnectWorkerRequest {
+                version: NATIVELINK_VERSION.to_string(),
+                ..Default::default()
+            }
+        );
     }
 
     // Handle registration (kill_all not called unless registered).
@@ -176,6 +351,7 @@ async fn kill_all_called_on_disconnect() -> Result<(), Error> {
                 encode_stream_proto(&UpdateForWorker {
                     update: Some(Update::ConnectionResult(ConnectionResult {
                         worker_id: "foobar".to_string(),
+                        ..Default::default()
                     })),
                 })
                 .unwrap(),
@@ -204,7 +380,13 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_eq!(
+            props,
+            ConnectWorkerRequest {
+                version: NATIVELINK_VERSION.to_string(),
+                ..Default::default()
+            }
+        );
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -217,6 +399,7 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
                 encode_stream_proto(&UpdateForWorker {
                     update: Some(Update::ConnectionResult(ConnectionResult {
                         worker_id: expected_worker_id.clone(),
+                        ..Default::default()
                     })),
                 })
                 .unwrap(),
@@ -294,7 +477,13 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_eq!(
+            props,
+            ConnectWorkerRequest {
+                version: NATIVELINK_VERSION.to_string(),
+                ..Default::default()
+            }
+        );
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -307,6 +496,7 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
                 encode_stream_proto(&UpdateForWorker {
                     update: Some(Update::ConnectionResult(ConnectionResult {
                         worker_id: expected_worker_id.clone(),
+                        ..Default::default()
                     })),
                 })
                 .unwrap(),
@@ -572,7 +762,13 @@ async fn experimental_precondition_script_fails() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_eq!(
+            props,
+            ConnectWorkerRequest {
+                version: NATIVELINK_VERSION.to_string(),
+                ..Default::default()
+            }
+        );
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -585,6 +781,7 @@ async fn experimental_precondition_script_fails() -> Result<(), Error> {
                 encode_stream_proto(&UpdateForWorker {
                     update: Some(Update::ConnectionResult(ConnectionResult {
                         worker_id: expected_worker_id.clone(),
+                        ..Default::default()
                     })),
                 })
                 .unwrap(),
@@ -659,7 +856,13 @@ async fn kill_action_request_kills_action() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_eq!(
+            props,
+            ConnectWorkerRequest {
+                version: NATIVELINK_VERSION.to_string(),
+                ..Default::default()
+            }
+        );
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -672,6 +875,7 @@ async fn kill_action_request_kills_action() -> Result<(), Error> {
                 encode_stream_proto(&UpdateForWorker {
                     update: Some(Update::ConnectionResult(ConnectionResult {
                         worker_id: expected_worker_id.clone(),
+                        ..Default::default()
                     })),
                 })
                 .unwrap(),
@@ -756,7 +960,13 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_eq!(
+            props,
+            ConnectWorkerRequest {
+                version: NATIVELINK_VERSION.to_string(),
+                ..Default::default()
+            }
+        );
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -768,6 +978,7 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
                 encode_stream_proto(&UpdateForWorker {
                     update: Some(Update::ConnectionResult(ConnectionResult {
                         worker_id: expected_worker_id.clone(),
+                        ..Default::default()
                     })),
                 })
                 .unwrap(),
@@ -867,7 +1078,13 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_eq!(
+            props,
+            ConnectWorkerRequest {
+                version: NATIVELINK_VERSION.to_string(),
+                ..Default::default()
+            }
+        );
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -879,6 +1096,7 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
                 encode_stream_proto(&UpdateForWorker {
                     update: Some(Update::ConnectionResult(ConnectionResult {
                         worker_id: expected_worker_id.clone(),
+                        ..Default::default()
                     })),
                 })
                 .unwrap(),
@@ -990,7 +1208,13 @@ async fn keep_alive_fail_logs() -> Result<(), Error> {
         .client
         .expect_connect_worker(Ok(streaming_response))
         .await;
-    assert_eq!(props, ConnectWorkerRequest::default());
+    assert_eq!(
+        props,
+        ConnectWorkerRequest {
+            version: NATIVELINK_VERSION.to_string(),
+            ..Default::default()
+        }
+    );
 
     // handle connection result to scheduler
     let tx_stream = test_context.maybe_tx_stream.take().unwrap();
@@ -999,6 +1223,7 @@ async fn keep_alive_fail_logs() -> Result<(), Error> {
             encode_stream_proto(&UpdateForWorker {
                 update: Some(Update::ConnectionResult(ConnectionResult {
                     worker_id: "foobar".to_string(),
+                    ..Default::default()
                 })),
             })
             .unwrap(),
