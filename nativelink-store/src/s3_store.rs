@@ -21,6 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aws_config::default_provider::credentials;
 use aws_config::provider_config::ProviderConfig;
+use aws_config::timeout::TimeoutConfig;
 use aws_config::{AppName, BehaviorVersion};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
@@ -82,6 +83,26 @@ const DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST: usize = 5 * 1024 * 1024; // 5MB.
 // Note: If you change this, adjust the docs in the config.
 const DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS: usize = 10;
 
+// Default timeout in seconds for establishing a connection to S3.
+// Note: If you change this, adjust the docs in the config.
+const DEFAULT_CONNECTION_TIMEOUT_S: u64 = 15;
+
+/// Builds the AWS SDK timeout configuration from the spec, falling back to
+/// the historical hardcoded 15s connect timeout when unset.
+fn timeout_config(spec: &ExperimentalAwsSpec) -> TimeoutConfig {
+    let connection_timeout_s = if spec.connection_timeout_s > 0 {
+        spec.connection_timeout_s
+    } else {
+        DEFAULT_CONNECTION_TIMEOUT_S
+    };
+    let mut builder =
+        TimeoutConfig::builder().connect_timeout(Duration::from_secs(connection_timeout_s));
+    if spec.operation_timeout_s > 0 {
+        builder = builder.operation_timeout(Duration::from_secs(spec.operation_timeout_s));
+    }
+    builder.build()
+}
+
 #[derive(Debug, MetricsComponent)]
 pub struct S3Store<NowFn> {
     s3_client: Arc<Client>,
@@ -123,11 +144,7 @@ where
             let config = aws_config::defaults(BehaviorVersion::latest())
                 .credentials_provider(credential_provider)
                 .app_name(AppName::new("nativelink").expect("valid app name"))
-                .timeout_config(
-                    aws_config::timeout::TimeoutConfig::builder()
-                        .connect_timeout(Duration::from_secs(15))
-                        .build(),
-                )
+                .timeout_config(timeout_config(spec))
                 .region(Region::new(Cow::Owned(spec.region.clone())))
                 .http_client(http_client)
                 .load()
@@ -705,5 +722,34 @@ where
 
     async fn check_health(&self, namespace: Cow<'static, str>) -> HealthStatus {
         StoreDriver::check_health(Pin::new(self), namespace).await
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use pretty_assertions::assert_eq;
+
+    use super::{DEFAULT_CONNECTION_TIMEOUT_S, Duration, ExperimentalAwsSpec, timeout_config};
+
+    #[test]
+    fn s3_timeout_config_defaults_preserve_historical_behavior() {
+        let config = timeout_config(&ExperimentalAwsSpec::default());
+        assert_eq!(
+            config.connect_timeout(),
+            Some(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_S))
+        );
+        assert_eq!(config.operation_timeout(), None);
+    }
+
+    #[test]
+    fn s3_timeout_config_uses_configured_timeouts() {
+        let spec = ExperimentalAwsSpec {
+            connection_timeout_s: 120,
+            operation_timeout_s: 300,
+            ..Default::default()
+        };
+        let config = timeout_config(&spec);
+        assert_eq!(config.connect_timeout(), Some(Duration::from_secs(120)));
+        assert_eq!(config.operation_timeout(), Some(Duration::from_secs(300)));
     }
 }
