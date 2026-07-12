@@ -408,71 +408,82 @@ where
         let mut maybe_reloaded_awaited_action: Option<AwaitedAction> = None;
         let now = (self.now_fn)().now();
 
-        // Check if client has timed out
-        if awaited_action.last_client_keepalive_timestamp() + self.client_action_timeout < now {
+        // Check if the client has timed out. This only applies to actions
+        // that are not finished yet: they still consume scheduler and worker
+        // resources, so they are timed out once no client is listening
+        // anymore. Finished actions must stay visible to clients until the
+        // database evicts them (see `retain_completed_for_s`), so a client
+        // that reconnects via WaitExecution after a dropped connection can
+        // still fetch the terminal state instead of getting a spurious
+        // NotFound. See <https://github.com/TraceMachina/nativelink/issues/2183>.
+        if !awaited_action.state().stage.is_finished()
+            && awaited_action.last_client_keepalive_timestamp() + self.client_action_timeout < now
+        {
             // This may change if the version is out of date.
             let mut timed_out = true;
-            if !awaited_action.state().stage.is_finished() {
-                let mut state = awaited_action.state().as_ref().clone();
-                warn!(operation_id = ?awaited_action.operation_id(), timeout_secs = self.client_action_timeout.as_secs_f32(), "Operation timed out having no more clients listening");
-                state.stage = ActionStage::Completed(ActionResult {
-                    error: Some(make_err!(
-                        Code::DeadlineExceeded,
-                        "Operation timed out {} seconds of having no more clients listening",
-                        self.client_action_timeout.as_secs_f32(),
-                    )),
-                    ..ActionResult::default()
-                });
-                state.last_transition_timestamp = now;
-                let state = Arc::new(state);
-                // We may be competing with an client timestamp update, so try
-                // this a few times.
-                for attempt in 1..=MAX_UPDATE_RETRIES {
-                    let mut new_awaited_action = match &maybe_reloaded_awaited_action {
-                        None => awaited_action.clone(),
-                        Some(reloaded_awaited_action) => reloaded_awaited_action.clone(),
-                    };
-                    new_awaited_action.worker_set_state(state.clone(), (self.now_fn)().now());
-                    let err = match self
-                        .action_db
-                        .update_awaited_action(new_awaited_action)
-                        .await
-                    {
-                        Ok(()) => break,
-                        Err(err) => err,
-                    };
-                    // Reload from the database if the action was outdated.
-                    let maybe_awaited_action =
-                        if attempt == MAX_UPDATE_RETRIES || err.code != Code::Aborted {
-                            None
-                        } else {
-                            subscriber.borrow().await.ok()
-                        };
-                    if let Some(reloaded_awaited_action) = maybe_awaited_action {
-                        maybe_reloaded_awaited_action = Some(reloaded_awaited_action);
+            let mut state = awaited_action.state().as_ref().clone();
+            warn!(operation_id = ?awaited_action.operation_id(), timeout_secs = self.client_action_timeout.as_secs_f32(), "Operation timed out having no more clients listening");
+            state.stage = ActionStage::Completed(ActionResult {
+                error: Some(make_err!(
+                    Code::DeadlineExceeded,
+                    "Operation timed out {} seconds of having no more clients listening",
+                    self.client_action_timeout.as_secs_f32(),
+                )),
+                ..ActionResult::default()
+            });
+            state.last_transition_timestamp = now;
+            let state = Arc::new(state);
+            // We may be competing with an client timestamp update, so try
+            // this a few times.
+            for attempt in 1..=MAX_UPDATE_RETRIES {
+                let mut new_awaited_action = match &maybe_reloaded_awaited_action {
+                    None => awaited_action.clone(),
+                    Some(reloaded_awaited_action) => reloaded_awaited_action.clone(),
+                };
+                new_awaited_action.worker_set_state(state.clone(), (self.now_fn)().now());
+                let err = match self
+                    .action_db
+                    .update_awaited_action(new_awaited_action)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(err) => err,
+                };
+                // Reload from the database if the action was outdated.
+                let maybe_awaited_action =
+                    if attempt == MAX_UPDATE_RETRIES || err.code != Code::Aborted {
+                        None
                     } else {
-                        warn!(
-                            "Failed to update action to timed out state after client keepalive timeout. This is ok if multiple schedulers tried to set the state at the same time: {err}",
-                        );
-                        break;
-                    }
-                    // Re-check the predicate after reload.
-                    if maybe_reloaded_awaited_action
-                        .as_ref()
-                        .is_some_and(|awaited_action| {
-                            awaited_action.last_client_keepalive_timestamp()
-                                + self.client_action_timeout
-                                >= (self.now_fn)().now()
-                        })
-                    {
-                        timed_out = false;
-                        break;
-                    } else if maybe_reloaded_awaited_action
-                        .as_ref()
-                        .is_some_and(|awaited_action| awaited_action.state().stage.is_finished())
-                    {
-                        break;
-                    }
+                        subscriber.borrow().await.ok()
+                    };
+                if let Some(reloaded_awaited_action) = maybe_awaited_action {
+                    maybe_reloaded_awaited_action = Some(reloaded_awaited_action);
+                } else {
+                    warn!(
+                        "Failed to update action to timed out state after client keepalive timeout. This is ok if multiple schedulers tried to set the state at the same time: {err}",
+                    );
+                    break;
+                }
+                // Re-check the predicate after reload.
+                if maybe_reloaded_awaited_action
+                    .as_ref()
+                    .is_some_and(|awaited_action| {
+                        awaited_action.last_client_keepalive_timestamp()
+                            + self.client_action_timeout
+                            >= (self.now_fn)().now()
+                    })
+                {
+                    timed_out = false;
+                    break;
+                } else if maybe_reloaded_awaited_action
+                    .as_ref()
+                    .is_some_and(|awaited_action| awaited_action.state().stage.is_finished())
+                {
+                    // The action finished while we were trying to time it
+                    // out. Finished actions are never hidden by the client
+                    // timeout; the stage filters below still apply.
+                    timed_out = false;
+                    break;
                 }
             }
             if timed_out {

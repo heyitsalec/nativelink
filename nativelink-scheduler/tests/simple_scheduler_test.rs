@@ -1639,6 +1639,136 @@ async fn update_action_sends_completed_result_after_disconnect() -> Result<(), E
     Ok(())
 }
 
+// Regression test for <https://github.com/TraceMachina/nativelink/issues/2183>.
+// A client that reconnects via WaitExecution after its Execute stream broke
+// stops sending client keep alives while it is away. If the action completed
+// in the meantime, the completed result must stay visible to the client for
+// as long as the database retains it (`retain_completed_for_s`) instead of
+// being hidden by `client_action_timeout_s` and surfacing as a spurious
+// NOT_FOUND "Failed to find existing task".
+#[nativelink_test]
+async fn wait_execution_finds_completed_action_after_client_keepalive_timeout() -> Result<(), Error>
+{
+    const CLIENT_ACTION_TIMEOUT_S: u64 = 60;
+    // Keep completed actions around much longer than the client timeout so
+    // that retention is governed by this knob alone.
+    const RETAIN_COMPLETED_FOR_S: u32 = 600;
+
+    let worker_id = WorkerId("worker_id".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            client_action_timeout_s: CLIENT_ACTION_TIMEOUT_S,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            RETAIN_COMPLETED_FOR_S,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    );
+    let action_digest = DigestInfo::new([99u8; 32], 512);
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+    let insert_timestamp = make_system_time(1);
+    let action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    let client_id = action_listener
+        .as_state()
+        .await
+        .unwrap()
+        .0
+        .client_operation_id
+        .clone();
+
+    // Drop our receiver (client disconnected) and don't reconnect until
+    // well past the client keep alive timeout.
+    drop(action_listener);
+
+    let operation_id = {
+        // Other tests check full data. We only care if we got StartAction.
+        let operation_id = match rx_from_worker.recv().await.unwrap().update {
+            Some(update_for_worker::Update::StartAction(exec)) => exec.operation_id,
+            v => panic!("Expected StartAction, got : {v:?}"),
+        };
+        OperationId::from(operation_id)
+    };
+
+    let action_result = ActionResult {
+        output_files: Vec::default(),
+        output_folders: Vec::default(),
+        output_file_symlinks: Vec::default(),
+        output_directory_symlinks: Vec::default(),
+        exit_code: 0,
+        stdout_digest: DigestInfo::new([6u8; 32], 19),
+        stderr_digest: DigestInfo::new([7u8; 32], 20),
+        execution_metadata: ExecutionMetadata {
+            worker: worker_id.to_string(),
+            queued_timestamp: make_system_time(5),
+            worker_start_timestamp: make_system_time(6),
+            worker_completed_timestamp: make_system_time(7),
+            input_fetch_start_timestamp: make_system_time(8),
+            input_fetch_completed_timestamp: make_system_time(9),
+            execution_start_timestamp: make_system_time(10),
+            execution_completed_timestamp: make_system_time(11),
+            output_upload_start_timestamp: make_system_time(12),
+            output_upload_completed_timestamp: make_system_time(13),
+        },
+        server_logs: HashMap::default(),
+        error: None,
+        message: String::new(),
+    };
+    scheduler
+        .update_action(
+            &worker_id,
+            &operation_id,
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                action_result.clone(),
+            )),
+        )
+        .await?;
+
+    // The client stays away long enough for its keep alive to be considered
+    // timed out, but the completed action is still within the retention
+    // window.
+    MockClock::advance(Duration::from_secs(CLIENT_ACTION_TIMEOUT_S + 30));
+
+    // This is the same lookup ExecutionServer::inner_wait_execution performs;
+    // yielding no item there turns into NOT_FOUND "Failed to find existing
+    // task".
+    let mut action_listener = scheduler
+        .filter_operations(OperationFilter {
+            client_operation_id: Some(client_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .next()
+        .await
+        .expect("Completed action should still be findable within the retention window");
+    {
+        // Client should get notification saying it has been completed.
+        let (action_state, _maybe_origin_metadata) = action_listener.changed().await.unwrap();
+        let expected_action_state = ActionState {
+            // Name is a random string, so we ignore it and just make it the same.
+            client_operation_id: action_state.client_operation_id.clone(),
+            stage: ActionStage::Completed(action_result),
+            action_digest: action_state.action_digest,
+            last_transition_timestamp: SystemTime::now(),
+        };
+        assert_eq!(action_state.as_ref(), &expected_action_state);
+    }
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn update_action_with_wrong_worker_id_errors_test() -> Result<(), Error> {
     let good_worker_id = WorkerId("good_worker_id".to_string());
