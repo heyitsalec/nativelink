@@ -599,3 +599,41 @@ async fn test_multipart_upload_large_file() -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// Issue #2511: real-server integration test against Azurite. Ignored by
+/// default because it needs a live server; CI runs it through
+/// `integration_tests/azure/azurite-with-nativelink-test.nix`. Run locally
+/// with:
+///
+/// ```sh
+/// AZURITE_SAS_CONTAINER_URL='http://127.0.0.1:10000/devstoreaccount1/<container>?<sas>' \
+///     cargo test -p nativelink-store azure_store_azurite -- --ignored
+/// ```
+///
+/// The container must already exist (the integration script creates it).
+#[nativelink_test]
+#[ignore = "needs a live Azurite server; see integration_tests/azure/"]
+async fn azure_store_azurite_round_trip() -> Result<(), Error> {
+    let sas_url = std::env::var("AZURITE_SAS_CONTAINER_URL")
+        .expect("AZURITE_SAS_CONTAINER_URL must point at a live Azurite container");
+    let spec = ExperimentalAzureSpec {
+        sas_url: Some(sas_url),
+        ..Default::default()
+    };
+    let store = AzureBlobStore::new(&spec, MockInstantWrapped::default).await?;
+
+    let data = Bytes::from_static(b"azurite integration payload");
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    let digest = DigestInfo::new(hasher.finalize().into(), data.len() as u64);
+
+    store.update_oneshot(digest, data.clone()).await?;
+    assert_eq!(
+        store.has(digest).await?,
+        Some(data.len() as u64),
+        "Expected uploaded blob to exist"
+    );
+    let fetched = store.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(fetched, data, "Round-tripped blob must match");
+    Ok(())
+}

@@ -136,7 +136,7 @@ jobs:
     name: ${{ matrix.test-name }}
     strategy:
       matrix:
-          test-name: [buildstream, buck2, mongo]
+          test-name: [buildstream, buck2, mongo, azure]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
