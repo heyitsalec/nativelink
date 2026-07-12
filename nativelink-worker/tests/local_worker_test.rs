@@ -194,6 +194,103 @@ async fn kill_all_called_on_disconnect() -> Result<(), Error> {
 }
 
 #[nativelink_test]
+async fn reconnects_with_action_in_transit_on_disconnect_test() -> Result<(), Error> {
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        // Ensure our worker connects and properties were sent.
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_eq!(props, ConnectWorkerRequest::default());
+    }
+
+    let expected_worker_id = "foobar".to_string();
+
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        // First initialize our worker by sending the response to the connection request.
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+
+    {
+        // Send execution request.
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::StartAction(StartExecute {
+                        execute_request: Some((&action_info).into()),
+                        operation_id: String::new(),
+                        queued_timestamp: None,
+                        platform: Some(Platform::default()),
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    // Wait until the action is genuinely in transit: the manager received
+    // the create_and_add_action call, but we deliberately never respond,
+    // so the action cannot finish registering.
+    let (worker_id, _start_execute) = test_context
+        .actions_manager
+        .wait_create_and_add_action_call()
+        .await;
+    assert_eq!(worker_id, expected_worker_id);
+
+    // Disconnect our grpc stream while the action is still in transit.
+    drop(tx_stream);
+
+    // The worker must degrade to kill_all + reconnect. Before issue #2115
+    // was fixed this path returned a fatal error, which terminated the
+    // whole worker process via try_join_all in nativelink.rs.
+    test_context.actions_manager.expect_kill_all().await;
+
+    {
+        // Client should try to auto reconnect and check our properties again.
+        let (_, streaming_response) = setup_grpc_stream();
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_eq!(props, ConnectWorkerRequest::default());
+    }
+
+    Ok(())
+}
+
+#[nativelink_test]
 async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
     let mut test_context = setup_local_worker(HashMap::new()).await;
     let streaming_response = test_context.maybe_streaming_response.take().unwrap();
