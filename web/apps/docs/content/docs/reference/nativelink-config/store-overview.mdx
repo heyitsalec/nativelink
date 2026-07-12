@@ -149,9 +149,10 @@ instead of declaring the same backend twice:
       filesystem: { content_path: "/var/lib/nativelink/cas", temp_path: "/var/lib/nativelink/tmp" },
     },
     {
-      // The worker's fast/local tier and the AC's fast tier now share
-      // one filesystem store instead of each scanning their own copy.
-      name: "AC_MAIN_STORE",
+      // The CAS service uses FS_CONTENT_STORE directly; the worker's
+      // fast/local tier references the same instance instead of
+      // scanning its own copy of the data.
+      name: "WORKER_FAST_SLOW_STORE",
       fast_slow: {
         fast: { ref_store: { name: "FS_CONTENT_STORE" } },
         slow: { noop: {} },
@@ -160,6 +161,28 @@ instead of declaring the same backend twice:
   ],
 }
 ```
+
+<Callout type="warn" title="Never share a store between AC and CAS">
+  Sharing like this works because both trees hold CAS data, keyed by
+  content digest. The AC plays by different rules: it stores a
+  serialized `ActionResult` under the *action's* digest — and the
+  `Action` message itself already sits in the CAS under that exact
+  digest. Point `ac_store` and `cas_store` at the same backend and
+  every action-cache write is a same-key overwrite: CAS reads hand
+  back bytes that no longer match their digest, and AC reads pull
+  back bytes that fail to decode.
+
+  NativeLink rejects the literal case at startup — if the `cas` and
+  `ac` services for the same instance name reference the same store
+  name, config loading fails with `CAS and AC use the same store`.
+  It can't see through composition, though: two store names that
+  resolve to the same backend (a shared `ref_store` target, two
+  `filesystem` stores on one `content_path`, one bucket without
+  distinct `key_prefix`es), AC and CAS under different instance
+  names, or a worker's `upload_action_result.ac_store` all slip past
+  the check and collide silently at runtime. Give the AC its own
+  backend — a separate path, bucket, or key prefix.
+</Callout>
 
 ## What's next
 
