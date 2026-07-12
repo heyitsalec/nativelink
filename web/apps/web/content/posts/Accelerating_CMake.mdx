@@ -22,6 +22,20 @@ By using them together, you can distribute your build jobs and cache their resul
 
 -----
 
+### Prerequisites
+
+Before you start, you'll want:
+
+  * **Basic C and Make familiarity.** The example builds a C "hello, world" with a Makefile — if you can read those two files, you're set. No Bazel or Buck2 knowledge is needed.
+  * **[Apache BuildStream](https://buildstream.build/) 2.4 or newer.** The `project.conf` below pins `min-version: 2.4`. If BuildStream is new to you, skim the [BuildStream documentation](https://docs.buildstream.build/) first — this tutorial only explains the pieces it uses.
+  * **[buildbox](https://gitlab.com/BuildGrid/buildbox/buildbox)**, the build-execution tooling BuildStream relies on. The launch script in the final section puts its binaries on `PATH` before invoking `bst`.
+  * **[Nix](https://nixos.org/download/).** The launch script is a Nix expression that supplies `nativelink`, `buildstream`, and `buildbox`. You can adapt it to another package manager, but as written it depends on Nix.
+  * **Nativelink.** New to it? The [getting-started guide](https://docs.nativelink.com/getting-started/setup) takes you from zero to a running instance. The launch script below starts one for you using config files from the [Nativelink repository](https://github.com/TraceMachina/nativelink)'s `integration_tests/buildstream/` directory, so clone the repository if you want to run it verbatim.
+
+The Alpine base image the example imports is an x86_64 tarball, so the walkthrough as written targets x86_64 Linux.
+
+-----
+
 ### Project Setup
 
 Let's start by setting up our project directory. We'll create a structure to hold our source code, Makefile, and BuildStream configuration.
