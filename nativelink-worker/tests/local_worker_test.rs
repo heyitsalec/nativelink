@@ -1022,3 +1022,299 @@ async fn keep_alive_fail_logs() -> Result<(), Error> {
         "Timed out looking for KeepAlive logs"
     ))
 }
+
+/// Regression test for <https://github.com/TraceMachina/nativelink/issues/815>.
+/// With `max_action_executions` set, the worker accepts exactly that many
+/// actions: an N+1th `StartAction` is refused like during a shutdown, and
+/// once the in-flight action finishes the worker sends `GoingAway` and its
+/// `run` future resolves `Ok` (a graceful, permanent exit with no
+/// reconnect).
+#[nativelink_test]
+async fn worker_exits_gracefully_after_max_action_executions_test() -> Result<(), Error> {
+    const ARBITRARY_LARGE_TIMEOUT: f32 = 10000.;
+    let local_worker_config = LocalWorkerConfig {
+        max_action_executions: 1,
+        worker_api_endpoint: EndpointConfig {
+            timeout: Some(ARBITRARY_LARGE_TIMEOUT),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut test_context = setup_local_worker_with_config(local_worker_config).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        // Ensure our worker connects and properties were sent.
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_eq!(props, ConnectWorkerRequest::default());
+    }
+
+    let expected_worker_id = "foobar".to_string();
+
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        // First initialize our worker by sending the response to the connection request.
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+
+    // Send the first (and only allowed) execution request.
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::StartAction(StartExecute {
+                    execute_request: Some((&action_info).into()),
+                    operation_id: "op1".to_string(),
+                    queued_timestamp: None,
+                    platform: Some(Platform::default()),
+                    worker_id: expected_worker_id.clone(),
+                })),
+            })
+            .unwrap(),
+        ))
+        .await
+        .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+    // An N+1th StartAction while the first is still in flight must be
+    // refused exactly like during a shutdown.
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::StartAction(StartExecute {
+                    execute_request: Some((&action_info).into()),
+                    operation_id: "op2".to_string(),
+                    queued_timestamp: None,
+                    platform: Some(Platform::default()),
+                    worker_id: expected_worker_id.clone(),
+                })),
+            })
+            .unwrap(),
+        ))
+        .await
+        .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+    {
+        // The refusal for op2 arrives first: it is sent inline by the worker
+        // loop, while op1 is still waiting on the mock actions manager.
+        let refusal = test_context.client.expect_execution_response(Ok(())).await;
+        assert_eq!(
+            refusal,
+            ExecuteResult {
+                instance_name: INSTANCE_NAME.to_string(),
+                operation_id: "op2".to_string(),
+                result: Some(execute_result::Result::InternalError(
+                    make_err!(Code::ResourceExhausted, "Worker shutting down").into()
+                )),
+                resource_usage: None,
+            }
+        );
+    }
+
+    // Now drive op1 to completion.
+    let action_result = ActionResult {
+        output_files: vec![],
+        output_folders: vec![],
+        output_file_symlinks: vec![],
+        output_directory_symlinks: vec![],
+        exit_code: 0,
+        stdout_digest: DigestInfo::new([21u8; 32], 10),
+        stderr_digest: DigestInfo::new([22u8; 32], 10),
+        execution_metadata: ExecutionMetadata {
+            worker: expected_worker_id.clone(),
+            queued_timestamp: SystemTime::UNIX_EPOCH,
+            worker_start_timestamp: SystemTime::UNIX_EPOCH,
+            worker_completed_timestamp: SystemTime::UNIX_EPOCH,
+            input_fetch_start_timestamp: SystemTime::UNIX_EPOCH,
+            input_fetch_completed_timestamp: SystemTime::UNIX_EPOCH,
+            execution_start_timestamp: SystemTime::UNIX_EPOCH,
+            execution_completed_timestamp: SystemTime::UNIX_EPOCH,
+            output_upload_start_timestamp: SystemTime::UNIX_EPOCH,
+            output_upload_completed_timestamp: SystemTime::UNIX_EPOCH,
+        },
+        server_logs: HashMap::new(),
+        error: None,
+        message: String::new(),
+    };
+    let running_action = Arc::new(MockRunningAction::new());
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+    running_action
+        .simple_expect_get_finished_result(Ok(action_result.clone()))
+        .await?;
+    let (_stored_digest, _stored_result, _digest_hasher) = test_context
+        .actions_manager
+        .expect_cache_action_result()
+        .await;
+
+    {
+        // op1 completes normally even though the worker is already draining.
+        let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+        assert_eq!(
+            execution_response,
+            ExecuteResult {
+                instance_name: INSTANCE_NAME.to_string(),
+                operation_id: "op1".to_string(),
+                result: Some(execute_result::Result::ExecuteResponse(
+                    ActionStage::Completed(action_result).into()
+                )),
+                resource_usage: None,
+            }
+        );
+    }
+
+    // With no more actions in flight the worker deregisters itself...
+    test_context.client.expect_going_away(Ok(())).await;
+
+    // ...and its run future resolves cleanly: the worker is gone for good
+    // (a reconnect attempt would call connect_worker on the mock instead).
+    let run_result = test_context
+        .drop_guard
+        .await
+        .map_err(|e| make_input_err!("Worker task panicked: {e:?}"))?;
+    assert_eq!(run_result, Ok(()));
+
+    Ok(())
+}
+
+/// Counterpart to the issue #815 feature: with the default
+/// `max_action_executions` of 0 (unlimited) the worker keeps accepting
+/// actions and never exits on its own.
+#[nativelink_test]
+async fn worker_without_max_action_executions_never_exits_test() -> Result<(), Error> {
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        // Ensure our worker connects and properties were sent.
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_eq!(props, ConnectWorkerRequest::default());
+    }
+
+    let expected_worker_id = "foobar".to_string();
+
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        // First initialize our worker by sending the response to the connection request.
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+    let action_result = ActionResult {
+        output_files: vec![],
+        output_folders: vec![],
+        output_file_symlinks: vec![],
+        output_directory_symlinks: vec![],
+        exit_code: 0,
+        stdout_digest: DigestInfo::new([21u8; 32], 10),
+        stderr_digest: DigestInfo::new([22u8; 32], 10),
+        execution_metadata: ExecutionMetadata {
+            worker: expected_worker_id.clone(),
+            queued_timestamp: SystemTime::UNIX_EPOCH,
+            worker_start_timestamp: SystemTime::UNIX_EPOCH,
+            worker_completed_timestamp: SystemTime::UNIX_EPOCH,
+            input_fetch_start_timestamp: SystemTime::UNIX_EPOCH,
+            input_fetch_completed_timestamp: SystemTime::UNIX_EPOCH,
+            execution_start_timestamp: SystemTime::UNIX_EPOCH,
+            execution_completed_timestamp: SystemTime::UNIX_EPOCH,
+            output_upload_start_timestamp: SystemTime::UNIX_EPOCH,
+            output_upload_completed_timestamp: SystemTime::UNIX_EPOCH,
+        },
+        server_logs: HashMap::new(),
+        error: None,
+        message: String::new(),
+    };
+
+    // Run two actions back to back; the second acceptance proves the worker
+    // did not drain or exit after the first one.
+    for operation_id in ["op1", "op2"] {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::StartAction(StartExecute {
+                        execute_request: Some((&action_info).into()),
+                        operation_id: (*operation_id).to_string(),
+                        queued_timestamp: None,
+                        platform: Some(Platform::default()),
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+        let running_action = Arc::new(MockRunningAction::new());
+        test_context
+            .actions_manager
+            .expect_create_and_add_action(Ok(running_action.clone()))
+            .await;
+        running_action
+            .simple_expect_get_finished_result(Ok(action_result.clone()))
+            .await?;
+        let (_stored_digest, _stored_result, _digest_hasher) = test_context
+            .actions_manager
+            .expect_cache_action_result()
+            .await;
+        let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+        assert_eq!(execution_response.operation_id, *operation_id);
+    }
+
+    Ok(())
+}
