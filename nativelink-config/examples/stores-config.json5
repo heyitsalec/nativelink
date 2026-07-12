@@ -29,6 +29,8 @@
          "region": "eu-north-1",
          "bucket": "crossplane-bucket-af79aeca9",
          "key_prefix": "test-prefix-index/",
+         "connection_timeout_s": 30,
+         "operation_timeout_s": 600,
          "retry": {
            "max_retries": 6,
            "delay": 0.3,
