@@ -44,7 +44,7 @@ use nativelink_scheduler::awaited_action_db::{
 };
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
 use nativelink_scheduler::simple_scheduler::SimpleScheduler;
-use nativelink_scheduler::worker::Worker;
+use nativelink_scheduler::worker::{NATIVELINK_VERSION, Worker};
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::action_messages::{
     ActionInfo, ActionResult, ActionStage, ActionState, DirectoryInfo, ExecutionMetadata, FileInfo,
@@ -79,6 +79,7 @@ async fn verify_initial_connection_message(
         update: Some(update_for_worker::Update::ConnectionResult(
             ConnectionResult {
                 worker_id: worker_id.into(),
+                version: NATIVELINK_VERSION.to_string(),
             },
         )),
     };

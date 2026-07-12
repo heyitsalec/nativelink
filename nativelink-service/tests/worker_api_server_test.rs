@@ -36,7 +36,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_proto::google::rpc::Status as ProtoStatus;
 use nativelink_scheduler::api_worker_scheduler::ApiWorkerScheduler;
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
-use nativelink_scheduler::worker::ActionInfoWithProps;
+use nativelink_scheduler::worker::{is_version_mismatch, ActionInfoWithProps, NATIVELINK_VERSION};
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_service::worker_api_server::{ConnectWorkerStream, NowFn, WorkerApiServer};
 use nativelink_util::action_messages::{
@@ -153,6 +153,22 @@ async fn setup_api_server_with_task_limit(
     now_fn: NowFn,
     max_worker_tasks: u64,
 ) -> Result<TestContext, Error> {
+    setup_api_server_with_connect_worker_request(
+        worker_timeout,
+        now_fn,
+        ConnectWorkerRequest {
+            max_inflight_tasks: max_worker_tasks,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn setup_api_server_with_connect_worker_request(
+    worker_timeout: u64,
+    now_fn: NowFn,
+    connect_worker_request: ConnectWorkerRequest,
+) -> Result<TestContext, Error> {
     const SCHEDULER_NAME: &str = "DUMMY_SCHEDULE_NAME";
 
     const UUID_SIZE: usize = 36;
@@ -183,10 +199,6 @@ async fn setup_api_server_with_task_limit(
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
-    let connect_worker_request = ConnectWorkerRequest {
-        max_inflight_tasks: max_worker_tasks,
-        ..Default::default()
-    };
     let (tx, rx) = mpsc::channel(1);
     tx.send(Update::ConnectWorkerRequest(connect_worker_request))
         .await
@@ -216,6 +228,10 @@ async fn setup_api_server_with_task_limit(
         .err_tip(|| "Expected update field to be populated")?;
     let worker_id = match first_update {
         update_for_worker::Update::ConnectionResult(connection_result) => {
+            assert_eq!(
+                connection_result.version, NATIVELINK_VERSION,
+                "Scheduler must report its version in the ConnectionResult"
+            );
             connection_result.worker_id
         }
         other => unreachable!("Expected ConnectionResult, got {:?}", other),
@@ -247,6 +263,104 @@ pub async fn connect_worker_adds_worker_to_scheduler_test()
         .contains_worker_for_test(&test_context.worker_id)
         .await;
     assert!(worker_exists, "Expected worker to exist in worker map");
+
+    Ok(())
+}
+
+// Regression tests for https://github.com/TraceMachina/nativelink/issues/1253:
+// the scheduler warns when a worker connects with a different (known)
+// NativeLink version, but never rejects the connection.
+#[nativelink_test]
+pub async fn connect_worker_with_mismatched_version_warns_but_connects_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    const WARNING_MSG: &str = "Worker is running a different NativeLink version";
+
+    let mismatched_version = format!("{NATIVELINK_VERSION}-mismatch");
+    let test_context = setup_api_server_with_connect_worker_request(
+        BASE_WORKER_TIMEOUT_S,
+        Box::new(static_now_fn),
+        ConnectWorkerRequest {
+            version: mismatched_version.clone(),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    // A mismatched version must never prevent the worker from connecting.
+    assert!(
+        test_context
+            .scheduler
+            .contains_worker_for_test(&test_context.worker_id)
+            .await,
+        "Expected worker with mismatched version to be added to the pool"
+    );
+
+    if is_version_mismatch(NATIVELINK_VERSION, &mismatched_version) {
+        assert!(
+            logs_contain(WARNING_MSG),
+            "Expected a warning for the mismatched worker version"
+        );
+    } else {
+        // Our own version is unknown (unstamped build), so even a differing
+        // worker version must stay quiet.
+        assert!(
+            !logs_contain(WARNING_MSG),
+            "Unknown own version must not warn"
+        );
+    }
+
+    Ok(())
+}
+
+#[nativelink_test]
+pub async fn connect_worker_with_matching_version_logs_no_warning_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    const WARNING_MSG: &str = "Worker is running a different NativeLink version";
+
+    let test_context = setup_api_server_with_connect_worker_request(
+        BASE_WORKER_TIMEOUT_S,
+        Box::new(static_now_fn),
+        ConnectWorkerRequest {
+            version: NATIVELINK_VERSION.to_string(),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    assert!(
+        test_context
+            .scheduler
+            .contains_worker_for_test(&test_context.worker_id)
+            .await,
+        "Expected worker to be added to the pool"
+    );
+    assert!(
+        !logs_contain(WARNING_MSG),
+        "Matching versions must not warn"
+    );
+
+    Ok(())
+}
+
+#[nativelink_test]
+pub async fn connect_worker_without_version_still_connects_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    const WARNING_MSG: &str = "Worker is running a different NativeLink version";
+
+    // An old worker that predates version reporting sends an empty version.
+    let test_context = setup_api_server(BASE_WORKER_TIMEOUT_S, Box::new(static_now_fn)).await?;
+
+    assert!(
+        test_context
+            .scheduler
+            .contains_worker_for_test(&test_context.worker_id)
+            .await,
+        "Expected versionless worker to be added to the pool"
+    );
+    assert!(
+        !logs_contain(WARNING_MSG),
+        "A worker without a version must not warn"
+    );
 
     Ok(())
 }

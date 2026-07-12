@@ -30,6 +30,26 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub type WorkerTimestamp = u64;
 
+/// The `NativeLink` version of this build, exchanged between workers and
+/// schedulers to detect mismatched deployments. This is the same source
+/// that `nativelink --version` reports. Note: bazel builds that do not
+/// stamp a version report the `rules_rust` placeholder "0.0.0", which
+/// [`is_version_mismatch`] treats as unknown.
+pub const NATIVELINK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Returns true when `own` and `peer` are both known `NativeLink` versions
+/// that differ. An empty version (for example a peer that predates version
+/// reporting) or the "0.0.0" placeholder of unstamped bazel builds is
+/// treated as unknown and never reported as a mismatch.
+/// Note: Keep in sync with the copy in `nativelink-worker/src/worker_utils.rs`.
+pub fn is_version_mismatch(own: &str, peer: &str) -> bool {
+    const UNKNOWN_VERSION: &str = "0.0.0";
+    if own.is_empty() || own == UNKNOWN_VERSION || peer.is_empty() || peer == UNKNOWN_VERSION {
+        return false;
+    }
+    own != peer
+}
+
 /// Represents the action info and the platform properties of the action.
 /// These platform properties have the type of the properties as well as
 /// the value of the properties, unlike `ActionInfo`, which only has the
@@ -104,6 +124,11 @@ pub struct Worker {
     #[metric(help = "Maximum inflight tasks for this worker (or 0 for unlimited)")]
     pub max_inflight_tasks: u64,
 
+    /// The `NativeLink` version the worker reported when it connected.
+    /// Empty when the worker predates version reporting.
+    #[metric(help = "The NativeLink version reported by the worker.")]
+    pub version: String,
+
     /// Stats about the worker.
     #[metric]
     metrics: Arc<Metrics>,
@@ -155,6 +180,7 @@ impl Worker {
             is_paused: false,
             is_draining: false,
             max_inflight_tasks,
+            version: String::new(),
             metrics: Arc::new(Metrics {
                 connected_timestamp: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -175,6 +201,7 @@ impl Worker {
             &self.tx,
             update_for_worker::Update::ConnectionResult(ConnectionResult {
                 worker_id: self.id.clone().into(),
+                version: NATIVELINK_VERSION.to_string(),
             }),
         )
         .err_tip(|| format!("Failed to send ConnectionResult to worker : {}", self.id))
