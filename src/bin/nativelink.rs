@@ -32,7 +32,7 @@ use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
 use nativelink_config::cas_server::{
     CasConfig, CasStoreConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig,
-    SchedulerConfig, ServerConfig, StoreConfig, WithInstanceName, WorkerConfig,
+    SchedulerConfig, ServerConfig, StoreConfig, WithInstanceName, WorkerApiConfig, WorkerConfig,
 };
 use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
@@ -60,10 +60,15 @@ use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::store_trait::{
     DEFAULT_DIGEST_SIZE_HEALTH_CHECK_CFG, set_default_digest_size_health_check,
 };
-use nativelink_util::task::TaskExecutor;
+use nativelink_util::task::{JoinHandleDropGuard, TaskExecutor};
 use nativelink_util::telemetry::init_tracing;
 use nativelink_util::{background_spawn, fs, spawn};
-use nativelink_worker::local_worker::new_local_worker;
+use nativelink_worker::local_worker::{
+    LocalWorker, new_local_worker, new_local_worker_with_connection_factory,
+};
+use nativelink_worker::local_worker_api_client::LocalWorkerApiClient;
+use nativelink_worker::running_actions_manager::RunningActionsManagerImpl;
+use nativelink_worker::worker_api_client_wrapper::WorkerApiClientTrait;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateRevocationListDer, PrivateKeyDer};
 use tokio::net::{TcpListener, TcpSocket};
@@ -722,32 +727,58 @@ async fn inner_main(
                     } else {
                         fast_slow_store.clone()
                     };
-                    let local_worker = new_local_worker(
-                        Arc::new(local_worker_cfg),
-                        fast_slow_store,
-                        maybe_ac_store,
-                        historical_store,
-                    )
-                    .await
-                    .err_tip(|| "Could not make LocalWorker")?;
-
-                    let name = if local_worker.name().is_empty() {
-                        format!("worker_{i}")
+                    let local_worker_cfg = Arc::new(local_worker_cfg);
+                    // A `local://<scheduler-name>` worker endpoint connects
+                    // the worker to the named in-process scheduler directly,
+                    // with no TCP/gRPC transport (issue #1847).
+                    if let Some(scheduler_name) = local_worker_cfg
+                        .worker_api_endpoint
+                        .uri
+                        .strip_prefix("local://")
+                        .map(str::to_string)
+                    {
+                        let worker_scheduler =
+                            worker_schedulers.get(&scheduler_name).err_tip(|| {
+                                format!(
+                                    "Worker '{}' has worker_api_endpoint uri 'local://{scheduler_name}', \
+                                     but no scheduler named '{scheduler_name}' exists in this config",
+                                    local_worker_cfg.name,
+                                )
+                            })?;
+                        let worker_api_server = WorkerApiServer::new(
+                            &WorkerApiConfig {
+                                scheduler: scheduler_name.clone(),
+                            },
+                            &HashMap::from([(scheduler_name.clone(), worker_scheduler.clone())]),
+                        )
+                        .err_tip(
+                            || "Failed to create in-process WorkerApiServer for local:// worker",
+                        )?;
+                        let client = LocalWorkerApiClient::new(Arc::new(worker_api_server));
+                        let local_worker = new_local_worker_with_connection_factory(
+                            local_worker_cfg,
+                            fast_slow_store,
+                            maybe_ac_store,
+                            historical_store,
+                            Box::new(move || {
+                                let client = client.clone();
+                                Box::pin(async move { Ok(client) })
+                            }),
+                        )
+                        .await
+                        .err_tip(|| "Could not make LocalWorker")?;
+                        spawn_local_worker(local_worker, i, &mut worker_names, &shutdown_tx)?
                     } else {
-                        local_worker.name().clone()
-                    };
-
-                    if worker_names.contains(&name) {
-                        Err(make_input_err!(
-                            "Duplicate worker name '{}' found in config",
-                            name
-                        ))?;
+                        let local_worker = new_local_worker(
+                            local_worker_cfg,
+                            fast_slow_store,
+                            maybe_ac_store,
+                            historical_store,
+                        )
+                        .await
+                        .err_tip(|| "Could not make LocalWorker")?;
+                        spawn_local_worker(local_worker, i, &mut worker_names, &shutdown_tx)?
                     }
-                    worker_names.insert(name.clone());
-                    let shutdown_rx = shutdown_tx.subscribe();
-                    let fut = trace_span!("worker_ctx", worker_name = %name)
-                        .in_scope(|| local_worker.run(shutdown_rx));
-                    spawn!("worker", fut, ?name)
                 }
             };
             root_futures.push(Box::pin(spawn_fut.map_ok_or_else(|e| Err(e.into()), |v| v)));
@@ -771,6 +802,33 @@ async fn inner_main(
     }
 
     Ok(())
+}
+
+/// Registers the worker's name (rejecting duplicates) and spawns its run
+/// loop. Generic over the client transport so gRPC-connected and in-process
+/// (`local://`) workers share one code path.
+fn spawn_local_worker<T: WorkerApiClientTrait + core::fmt::Debug + 'static>(
+    local_worker: LocalWorker<T, RunningActionsManagerImpl>,
+    index: usize,
+    worker_names: &mut HashSet<String>,
+    shutdown_tx: &broadcast::Sender<ShutdownGuard>,
+) -> Result<JoinHandleDropGuard<Result<(), Error>>, Error> {
+    let name = if local_worker.name().is_empty() {
+        format!("worker_{index}")
+    } else {
+        local_worker.name().clone()
+    };
+    if worker_names.contains(&name) {
+        Err(make_input_err!(
+            "Duplicate worker name '{}' found in config",
+            name
+        ))?;
+    }
+    worker_names.insert(name.clone());
+    let shutdown_rx = shutdown_tx.subscribe();
+    let fut =
+        trace_span!("worker_ctx", worker_name = %name).in_scope(|| local_worker.run(shutdown_rx));
+    Ok(spawn!("worker", fut, ?name))
 }
 
 fn get_config() -> Result<CasConfig, Error> {

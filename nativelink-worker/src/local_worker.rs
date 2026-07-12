@@ -521,7 +521,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
     }
 }
 
-type ConnectionFactory<T> = Box<dyn Fn() -> BoxFuture<'static, Result<T, Error>> + Send + Sync>;
+pub type ConnectionFactory<T> = Box<dyn Fn() -> BoxFuture<'static, Result<T, Error>> + Send + Sync>;
 
 pub struct LocalWorker<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> {
     config: Arc<LocalWorkerConfig>,
@@ -545,7 +545,8 @@ impl<
     }
 }
 
-/// Creates a new `LocalWorker`. The `cas_store` must be an instance of
+/// Creates a new `LocalWorker` that connects to the scheduler over gRPC at
+/// `worker_api_endpoint.uri`. The `cas_store` must be an instance of
 /// `FastSlowStore` and will be checked at runtime.
 pub async fn new_local_worker(
     config: Arc<LocalWorkerConfig>,
@@ -553,6 +554,59 @@ pub async fn new_local_worker(
     ac_store: Option<Store>,
     historical_store: Store,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
+    let connection_factory: ConnectionFactory<WorkerApiClientWrapper> = {
+        let config = config.clone();
+        Box::new(move || {
+            let config = config.clone();
+            Box::pin(async move {
+                let timeout = config
+                    .worker_api_endpoint
+                    .timeout
+                    .unwrap_or(DEFAULT_ENDPOINT_TIMEOUT_S);
+                let timeout_duration = Duration::from_secs_f32(timeout);
+                let tls_config =
+                    tls_utils::load_client_config(&config.worker_api_endpoint.tls_config)
+                        .err_tip(|| "Parsing local worker TLS configuration")?;
+                let endpoint =
+                    tls_utils::endpoint_from(&config.worker_api_endpoint.uri, tls_config)
+                        .map_err(|e| {
+                            Error::from_std_err(Code::InvalidArgument, &e)
+                                .append("Invalid URI for worker endpoint")
+                        })?
+                        .connect_timeout(timeout_duration)
+                        .timeout(timeout_duration);
+
+                let transport = endpoint.connect().await.map_err(|e| {
+                    Error::from_std_err(Code::Internal, &e).append(format!(
+                        "Could not connect to endpoint {}",
+                        config.worker_api_endpoint.uri
+                    ))
+                })?;
+                Ok(WorkerApiClient::new(transport).into())
+            })
+        })
+    };
+    new_local_worker_with_connection_factory(
+        config,
+        cas_store,
+        ac_store,
+        historical_store,
+        connection_factory,
+    )
+    .await
+}
+
+/// Like [`new_local_worker`], but with a caller-supplied transport: the
+/// `connection_factory` decides how the worker reaches its scheduler. Used
+/// for `local://<scheduler-name>` endpoints (issue #1847), where the binary
+/// injects an in-process client instead of a gRPC channel.
+pub async fn new_local_worker_with_connection_factory<T: WorkerApiClientTrait + 'static>(
+    config: Arc<LocalWorkerConfig>,
+    cas_store: Store,
+    ac_store: Option<Store>,
+    historical_store: Store,
+    connection_factory: ConnectionFactory<T>,
+) -> Result<LocalWorker<T, RunningActionsManagerImpl>, Error> {
     let fast_slow_store = cas_store
         .downcast_ref::<FastSlowStore>(None)
         .err_tip(|| "Expected store for LocalWorker's store to be a FastSlowStore")?
@@ -710,37 +764,9 @@ pub async fn new_local_worker(
             use_namespaces,
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
-        config.clone(),
+        config,
         running_actions_manager,
-        Box::new(move || {
-            let config = config.clone();
-            Box::pin(async move {
-                let timeout = config
-                    .worker_api_endpoint
-                    .timeout
-                    .unwrap_or(DEFAULT_ENDPOINT_TIMEOUT_S);
-                let timeout_duration = Duration::from_secs_f32(timeout);
-                let tls_config =
-                    tls_utils::load_client_config(&config.worker_api_endpoint.tls_config)
-                        .err_tip(|| "Parsing local worker TLS configuration")?;
-                let endpoint =
-                    tls_utils::endpoint_from(&config.worker_api_endpoint.uri, tls_config)
-                        .map_err(|e| {
-                            Error::from_std_err(Code::InvalidArgument, &e)
-                                .append("Invalid URI for worker endpoint")
-                        })?
-                        .connect_timeout(timeout_duration)
-                        .timeout(timeout_duration);
-
-                let transport = endpoint.connect().await.map_err(|e| {
-                    Error::from_std_err(Code::Internal, &e).append(format!(
-                        "Could not connect to endpoint {}",
-                        config.worker_api_endpoint.uri
-                    ))
-                })?;
-                Ok(WorkerApiClient::new(transport).into())
-            })
-        }),
+        connection_factory,
         Box::new(move |d| Box::pin(time::sleep(d))),
     );
     Ok(local_worker)

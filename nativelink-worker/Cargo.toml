@@ -14,6 +14,7 @@ nativelink-config = { path = "../nativelink-config" }
 nativelink-error = { path = "../nativelink-error" }
 nativelink-metric = { path = "../nativelink-metric" }
 nativelink-proto = { path = "../nativelink-proto" }
+nativelink-service = { path = "../nativelink-service" }
 nativelink-store = { path = "../nativelink-store" }
 nativelink-util = { path = "../nativelink-util" }
 
@@ -23,6 +24,7 @@ dunce = { version = "1.0.5", default-features = false }
 filetime = { version = "0.2.25", default-features = false }
 formatx = { version = "0.2.3", default-features = false }
 futures = { version = "0.3.31", default-features = false }
+hyper = { version = "1.6.0", default-features = false }
 opentelemetry = { version = "0.32.0", default-features = false }
 parking_lot = { version = "0.12.3", default-features = false }
 prost = { version = "0.14.4", default-features = false }
@@ -52,6 +54,7 @@ tonic = { version = "0.14.0", features = [
   "tls-ring",
   "transport",
 ], default-features = false }
+tonic-prost = { version = "0.14.6", default-features = false }
 tracing = { version = "0.1.41", default-features = false }
 uuid = { version = "1.16.0", default-features = false, features = [
   "serde",
@@ -66,9 +69,9 @@ libc = { version = "0.2.183", default-features = false }
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
+nativelink-scheduler = { path = "../nativelink-scheduler" }
 
 async-trait = { version = "0.1.88", default-features = false }
-hyper = { version = "1.6.0", default-features = false }
 pathdiff = { version = "0.2.3", default-features = false }
 pretty_assertions = { version = "1.4.1", features = [
   "std",
@@ -78,7 +81,6 @@ serial_test = { version = "3.2.0", features = [
   "async",
 ], default-features = false }
 tempfile = { version = "3.15.0", default-features = false }
-tonic-prost = { version = "0.14.6", default-features = false }
 tracing-test = { version = "0.2.5", default-features = false, features = [
   "no-env-filter",
 ] }

@@ -730,7 +730,16 @@ pub enum WorkerProperty {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct EndpointConfig {
-    /// URI of the endpoint.
+    /// URI of the endpoint, usually a gRPC address such as
+    /// `grpc://scheduler.example.com:50061`. For worker `worker_api_endpoint`
+    /// configurations, the special scheme `local://<scheduler-name>` connects
+    /// the worker directly to the named scheduler inside the same process,
+    /// with no TCP or gRPC transport; the scheduler name must match an entry
+    /// in this configuration's `schedulers` list, otherwise startup fails.
+    /// For `local://` endpoints `tls_config` is ignored; `timeout` does not
+    /// affect connection setup, but it still sets the worker's keep-alive
+    /// cadence (keep-alives are sent every `timeout / 2` seconds), so it
+    /// should stay below the scheduler's `worker_timeout_s`.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub uri: String,
 

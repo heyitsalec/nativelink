@@ -229,6 +229,18 @@ impl WorkerApiServer {
     ) -> Result<Response<ConnectWorkerStream>, Error> {
         self.inner_connect_worker(update_stream).await
     }
+
+    /// Connects an in-process worker (a `local://` `worker_api_endpoint`,
+    /// issue #1847) directly to this server's stream handling, bypassing
+    /// gRPC transport entirely. Stream lifetimes behave exactly like a gRPC
+    /// connection: when the returned stream or the given `update_stream`
+    /// ends, the worker is cleaned up as if the connection dropped.
+    pub async fn connect_worker_in_process(
+        &self,
+        update_stream: impl Stream<Item = Result<UpdateForScheduler, Status>> + Unpin + Send + 'static,
+    ) -> Result<Response<ConnectWorkerStream>, Error> {
+        self.inner_connect_worker(update_stream).await
+    }
 }
 
 #[tonic::async_trait]
