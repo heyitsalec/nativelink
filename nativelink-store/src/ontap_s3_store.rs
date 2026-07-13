@@ -345,6 +345,23 @@ where
         mut reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
     ) -> Result<u64, Error> {
+        // Zero-digest keys are special: the digest itself encodes emptiness,
+        // so there is nothing to upload and no network request to make
+        // (mirrors RedisStore/MongoStore).
+        if is_zero_digest(key.borrow()) {
+            let chunk = reader
+                .peek()
+                .await
+                .err_tip(|| "Failed to peek in OntapS3Store::update")?;
+            if chunk.is_empty() {
+                reader
+                    .drain()
+                    .await
+                    .err_tip(|| "Failed to drain in OntapS3Store::update")?;
+                return Ok(0);
+            }
+        }
+
         let s3_path = &self.make_s3_path(&key);
 
         let max_size = match size_info {

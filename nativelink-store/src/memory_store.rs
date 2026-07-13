@@ -147,6 +147,24 @@ impl StoreDriver for MemoryStore {
         mut reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
     ) -> Result<u64, Error> {
+        // Zero-digest keys are special: existence and reads are answered
+        // without consulting the map (see has_with_results/get_part), so
+        // there is nothing to buffer or insert (mirrors RedisStore/
+        // MongoStore).
+        if is_zero_digest(key.borrow()) {
+            let chunk = reader
+                .peek()
+                .await
+                .err_tip(|| "Failed to peek in MemoryStore::update")?;
+            if chunk.is_empty() {
+                reader
+                    .drain()
+                    .await
+                    .err_tip(|| "Failed to drain in MemoryStore::update")?;
+                return Ok(0);
+            }
+        }
+
         // A write whose exact size is at least this store's `max_bytes` can never
         // be usefully cached: the moment it's inserted, eviction drops it, since one
         // entry alone meets the budget. Buffering it into memory first is therefore
