@@ -54,7 +54,7 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
-use tracing::{Level, event, warn};
+use tracing::{Level, debug, event, warn};
 
 use crate::cas_utils::is_zero_digest;
 use crate::common_s3_utils::{TlsClient, install_default_rustls_crypto_provider};
@@ -227,7 +227,7 @@ where
     async fn has(self: Pin<&Self>, digest: StoreKey<'_>) -> Result<Option<u64>, Error> {
         let digest_clone = digest.into_owned();
         self.retrier
-            .retry(unfold((), move |state| {
+            .retry(unfold(0u32, move |attempt| {
                 let local_digest = digest_clone.clone();
                 async move {
                     let result = self
@@ -254,32 +254,41 @@ where
                                         })
                                         .collect();
                                     while callbacks.next().await.is_some() {}
-                                    return Some((RetryResult::Ok(None), state));
+                                    return Some((RetryResult::Ok(None), attempt));
                                 }
                             }
                             let Some(length) = head_object_output.content_length else {
-                                return Some((RetryResult::Ok(None), state));
+                                return Some((RetryResult::Ok(None), attempt));
                             };
                             if length >= 0 {
-                                return Some((RetryResult::Ok(Some(length as u64)), state));
+                                return Some((RetryResult::Ok(Some(length as u64)), attempt));
                             }
                             Some((
                                 RetryResult::Err(make_err!(
                                     Code::InvalidArgument,
                                     "Negative content length in ONTAP S3: {length:?}"
                                 )),
-                                state,
+                                attempt,
                             ))
                         }
                         Err(sdk_error) => match sdk_error.into_service_error() {
-                            HeadObjectError::NotFound(_) => Some((RetryResult::Ok(None), state)),
-                            other => Some((
-                                RetryResult::Retry(make_err!(
+                            HeadObjectError::NotFound(_) => Some((RetryResult::Ok(None), attempt)),
+                            other => {
+                                let err = make_err!(
                                     Code::Unavailable,
                                     "Unhandled HeadObjectError in ONTAP S3: {other:?}"
-                                )),
-                                state,
-                            )),
+                                );
+                                // Same rationale as S3Store::has: surface
+                                // non-NotFound HeadObject failures (e.g.
+                                // credential-chain failures) with one warn per
+                                // call, per-attempt detail at debug.
+                                if attempt == 0 {
+                                    warn!(?err, digest = %local_digest, "ONTAP S3 HeadObject failed; will retry");
+                                } else {
+                                    debug!(?err, digest = %local_digest, attempt, "ONTAP S3 HeadObject retry failed");
+                                }
+                                Some((RetryResult::Retry(err), attempt + 1))
+                            }
                         },
                     }
                 }

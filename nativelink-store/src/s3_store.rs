@@ -52,7 +52,7 @@ use nativelink_util::store_trait::{
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::cas_utils::is_zero_digest;
 use crate::common_s3_utils::{BodyWrapper, TlsClient};
@@ -179,7 +179,7 @@ where
     async fn has(self: Pin<&Self>, digest: StoreKey<'_>) -> Result<Option<u64>, Error> {
         let digest_clone = digest.into_owned();
         self.retrier
-            .retry(unfold((), move |state| {
+            .retry(unfold(0u32, move |attempt| {
                 let local_digest = digest_clone.clone();
                 async move {
                     let result = self
@@ -203,32 +203,41 @@ where
                                         .map(|callback| callback.callback(local_digest.borrow()))
                                         .collect();
                                     while callbacks.next().await.is_some() {}
-                                    return Some((RetryResult::Ok(None), state));
+                                    return Some((RetryResult::Ok(None), attempt));
                                 }
                             }
                             let Some(length) = head_object_output.content_length else {
-                                return Some((RetryResult::Ok(None), state));
+                                return Some((RetryResult::Ok(None), attempt));
                             };
                             if length >= 0 {
-                                return Some((RetryResult::Ok(Some(length as u64)), state));
+                                return Some((RetryResult::Ok(Some(length as u64)), attempt));
                             }
                             Some((
                                 RetryResult::Err(make_err!(
                                     Code::InvalidArgument,
                                     "Negative content length in S3: {length:?}",
                                 )),
-                                state,
+                                attempt,
                             ))
                         }
                         Err(sdk_error) => match sdk_error.into_service_error() {
-                            HeadObjectError::NotFound(_) => Some((RetryResult::Ok(None), state)),
-                            other => Some((
-                                RetryResult::Retry(
-                                    Error::from_std_err(Code::Unavailable, &other)
-                                        .append("Unhandled HeadObjectError in S3"),
-                                ),
-                                state,
-                            )),
+                            HeadObjectError::NotFound(_) => Some((RetryResult::Ok(None), attempt)),
+                            other => {
+                                let err = Error::from_std_err(Code::Unavailable, &other)
+                                    .append("Unhandled HeadObjectError in S3");
+                                // Surface non-NotFound HeadObject failures (e.g.
+                                // credential-chain/IRSA errors) instead of
+                                // retrying silently. Warn once per has() call on
+                                // the first failed attempt; keep the per-attempt
+                                // retry trace at debug so log volume is not
+                                // multiplied by the retry count at high QPS.
+                                if attempt == 0 {
+                                    warn!(?err, digest = %local_digest, "S3 HeadObject failed; will retry");
+                                } else {
+                                    debug!(?err, digest = %local_digest, attempt, "S3 HeadObject retry failed");
+                                }
+                                Some((RetryResult::Retry(err), attempt + 1))
+                            }
                         },
                     }
                 }

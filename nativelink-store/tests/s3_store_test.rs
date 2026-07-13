@@ -575,6 +575,77 @@ async fn multipart_update_large_cas() -> Result<(), Error> {
     Ok(())
 }
 
+// Regression test for issue #2420 (in-repo slice): non-NotFound HeadObject
+// failures used to be retried with no logging at all, which made credential
+// failures (e.g. broken IRSA chains on EKS) look like hangs. The first failed
+// attempt of a has() call warns; later attempts log at debug.
+#[nativelink_test]
+async fn has_logs_non_not_found_head_object_errors() -> Result<(), Error> {
+    let mock_client = StaticReplayClient::new(vec![
+        ReplayEvent::new(
+            http::Request::builder().body(SdkBody::empty()).unwrap(),
+            http::Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(SdkBody::empty())
+                .unwrap(),
+        ),
+        ReplayEvent::new(
+            http::Request::builder().body(SdkBody::empty()).unwrap(),
+            http::Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(SdkBody::empty())
+                .unwrap(),
+        ),
+        ReplayEvent::new(
+            http::Request::builder().body(SdkBody::empty()).unwrap(),
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, "111")
+                .body(SdkBody::empty())
+                .unwrap(),
+        ),
+    ]);
+    let test_config = Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::from_static(REGION))
+        .http_client(mock_client)
+        .build();
+    let s3_client = aws_sdk_s3::Client::from_conf(test_config);
+    let store = S3Store::new_with_client_and_jitter(
+        &ExperimentalAwsSpec {
+            bucket: BUCKET_NAME.to_string(),
+            common: CommonObjectSpec {
+                retry: nativelink_config::stores::Retry {
+                    max_retries: 1024,
+                    delay: 0.,
+                    jitter: 0.,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        s3_client,
+        Arc::new(move |_delay| Duration::from_secs(0)),
+        MockInstantWrapped::default,
+    )?;
+    let digest = DigestInfo::try_new(VALID_HASH1, 100).unwrap();
+    let result = store.has(digest).await;
+    assert_eq!(
+        result,
+        Ok(Some(111)),
+        "Expected to find item after retries, got: {result:?}"
+    );
+
+    // The first failed attempt must be visible at default log levels so
+    // credential-chain failures are diagnosable.
+    assert!(logs_contain("S3 HeadObject failed; will retry"));
+    // Subsequent attempts only log at debug to keep log volume from being
+    // multiplied by the retry count.
+    assert!(logs_contain("S3 HeadObject retry failed"));
+    Ok(())
+}
+
 #[nativelink_test]
 async fn ensure_empty_string_in_stream_works_test() -> Result<(), Error> {
     const CAS_ENTRY_SIZE: usize = 10; // Length of "helloworld".
