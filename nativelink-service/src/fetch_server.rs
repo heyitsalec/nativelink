@@ -30,9 +30,47 @@ use nativelink_util::store_trait::{Store, StoreLike};
 use opentelemetry::context::FutureExt;
 use prost::Message;
 use tonic::{Code, Request, Response, Status};
-use tracing::{Instrument, Level, error_span, info, instrument};
+use tracing::{Instrument, Level, error, error_span, info, instrument, warn};
 
 use crate::remote_asset_proto::{RemoteAssetArtifact, RemoteAssetQuery};
+
+/// Logs a failed RPC at a level matching who must act on it (issue #1826):
+/// request/precondition problems the CLIENT must fix log at WARN, while
+/// failures of this server or its backing infrastructure that the OPERATOR
+/// must act on log at ERROR. This replaces the blanket
+/// `err(level = ...)` that previously logged every error at one level.
+///
+/// Borderline codes, deliberately classified:
+/// - `Aborted` => WARN: a concurrency conflict the client resolves by
+///   retrying at a higher level; nothing is broken server-side.
+/// - `FailedPrecondition` => WARN: by gRPC contract the client must fix
+///   system state before retrying, so it flags a bad request sequence.
+/// - `DeadlineExceeded` => ERROR: however the deadline was chosen, this
+///   server failed to answer within it; latency on these endpoints is
+///   dominated by the backing store, making this an operator signal.
+/// - `ResourceExhausted` => ERROR: these endpoints have no per-client
+///   quota, so this code only arises from infrastructure backpressure.
+///
+/// Note: Keep in sync with the copy in `push_server.rs`.
+fn log_rpc_failure(rpc: &str, err: &Error) {
+    match err.code {
+        Code::Cancelled
+        | Code::InvalidArgument
+        | Code::NotFound
+        | Code::AlreadyExists
+        | Code::PermissionDenied
+        | Code::FailedPrecondition
+        | Code::Aborted
+        | Code::OutOfRange
+        | Code::Unimplemented
+        | Code::Unauthenticated => {
+            warn!(?err, "{rpc} failed with a client-side error");
+        }
+        // Unknown, DeadlineExceeded, ResourceExhausted, Internal,
+        // Unavailable and DataLoss are operator-actionable.
+        _ => error!(?err, "{rpc} failed with a server-side error"),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FetchStoreInfo {
@@ -128,8 +166,7 @@ impl FetchServer {
 impl Fetch for FetchServer {
     #[allow(clippy::blocks_in_conditions)]
     #[instrument(
-        err(level = Level::WARN),
-        ret(level = Level::INFO),
+        ret(level = Level::DEBUG),
         skip_all,
         fields(request = ?grpc_request.get_ref())
     )]
@@ -139,20 +176,26 @@ impl Fetch for FetchServer {
     ) -> Result<Response<FetchBlobResponse>, Status> {
         let request = grpc_request.into_inner();
         let digest_function = request.digest_function;
-        self.inner_fetch_blob(request)
-            .instrument(error_span!("fetch_server_fetch_blob"))
-            .with_context(
-                make_ctx_for_hash_func(digest_function).err_tip(|| "In FetchServer::fetch_blob")?,
-            )
-            .await
-            .err_tip(|| "Failed on fetch_blob() command")
-            .map_err(Into::into)
+        let result = async {
+            self.inner_fetch_blob(request)
+                .instrument(error_span!("fetch_server_fetch_blob"))
+                .with_context(
+                    make_ctx_for_hash_func(digest_function)
+                        .err_tip(|| "In FetchServer::fetch_blob")?,
+                )
+                .await
+                .err_tip(|| "Failed on fetch_blob() command")
+        }
+        .await;
+        result.map_err(|err| {
+            log_rpc_failure("fetch_blob", &err);
+            err.into()
+        })
     }
 
     #[allow(clippy::blocks_in_conditions)]
     #[instrument(
-        err(level = Level::WARN),
-        ret(level = Level::INFO),
+        ret(level = Level::DEBUG),
         skip_all,
         fields(request = ?_grpc_request.get_ref())
     )]
@@ -160,6 +203,8 @@ impl Fetch for FetchServer {
         &self,
         _grpc_request: Request<FetchDirectoryRequest>,
     ) -> Result<Response<FetchDirectoryResponse>, Status> {
-        Err(Status::unimplemented("FetchDirectory not implemented"))
+        let err = make_err!(Code::Unimplemented, "FetchDirectory not implemented");
+        log_rpc_failure("fetch_directory", &err);
+        Err(err.into())
     }
 }

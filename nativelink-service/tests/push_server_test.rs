@@ -31,7 +31,7 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::StoreLike;
 use prost::Message;
 use sha2::{Digest as Sha2Digest, Sha256};
-use tonic::{Request, Status};
+use tonic::{Code, Request, Status};
 
 async fn make_store_manager() -> Result<Arc<StoreManager>, Error> {
     let store_manager = Arc::new(StoreManager::new());
@@ -109,5 +109,105 @@ async fn test_push_blob() -> Result<(), Status> {
             0,
         )
     );
+    Ok(())
+}
+
+/// Issue #1826: client-caused failures log at WARN, not ERROR.
+#[nativelink_test]
+async fn push_blob_client_error_logs_warn() -> Result<(), Error> {
+    let store_manager = make_store_manager().await?;
+    let ps = PushServer::new(
+        &[WithInstanceName {
+            instance_name: "foo_instance_name".to_string(),
+            config: PushConfig {
+                push_store: String::from("test_push_store"),
+                // Pushing to a read-only endpoint is a client mistake
+                // (PermissionDenied).
+                read_only: true,
+            },
+        }],
+        &store_manager,
+    )
+    .expect("PushServer config error");
+
+    let result = ps
+        .push_blob(Request::new(PushBlobRequest {
+            instance_name: "foo_instance_name".to_string(),
+            ..Default::default()
+        }))
+        .await;
+    let Err(status) = result else {
+        panic!("Expected push_blob to fail with PermissionDenied");
+    };
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert!(logs_contain("push_blob failed with a client-side error"));
+    assert!(!logs_contain("server-side error"));
+    // The instrument macro's `ret` event fires unconditionally when `err(...)`
+    // is absent, echoing the Err return value. It must do so at DEBUG (the
+    // ac_server.rs precedent), not INFO, or every failure double-logs at the
+    // default INFO filter. tracing-test captures all levels regardless of the
+    // runtime filter, so the honest assertable invariant is the LEVEL of the
+    // echo line, not its absence.
+    logs_assert(|lines: &[&str]| {
+        match lines
+            .iter()
+            .filter(|line| line.contains("INFO") && line.contains("return"))
+            .count()
+        {
+            0 => Ok(()),
+            n => Err(format!("Expected no INFO-level return echo, got {n}")),
+        }
+    });
+
+    Ok(())
+}
+
+/// Issue #1826: server-side failures log at ERROR, not WARN.
+#[nativelink_test]
+async fn push_blob_server_error_logs_error() -> Result<(), Error> {
+    let store_manager = make_store_manager().await?;
+    let ps = PushServer::new(
+        &[WithInstanceName {
+            instance_name: "foo_instance_name".to_string(),
+            config: PushConfig {
+                push_store: String::from("test_push_store"),
+                read_only: false,
+            },
+        }],
+        &store_manager,
+    )
+    .expect("PushServer config error");
+
+    let result = ps
+        .push_blob(Request::new(PushBlobRequest {
+            // An instance this deployment doesn't serve surfaces as Internal
+            // (a config/routing mismatch the operator must look at).
+            instance_name: "not_configured_instance".to_string(),
+            ..Default::default()
+        }))
+        .await;
+    let Err(status) = result else {
+        panic!("Expected push_blob to fail for an unconfigured instance");
+    };
+    assert_eq!(status.code(), Code::Internal);
+    assert!(logs_contain("push_blob failed with a server-side error"));
+    assert!(!logs_contain("client-side error"));
+    // The instrument macro's `ret` event fires unconditionally when `err(...)`
+    // is absent, echoing the Err return value. It must do so at DEBUG (the
+    // ac_server.rs precedent), not INFO, or every failure double-logs at the
+    // default INFO filter. tracing-test captures all levels regardless of the
+    // runtime filter, so the honest assertable invariant is the LEVEL of the
+    // echo line, not its absence.
+    logs_assert(|lines: &[&str]| {
+        match lines
+            .iter()
+            .filter(|line| line.contains("INFO") && line.contains("return"))
+            .count()
+        {
+            0 => Ok(()),
+            n => Err(format!("Expected no INFO-level return echo, got {n}")),
+        }
+    });
+
     Ok(())
 }
