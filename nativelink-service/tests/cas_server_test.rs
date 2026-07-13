@@ -22,7 +22,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use nativelink_config::cas_server::WithInstanceName;
 use nativelink_config::stores::{MemorySpec, StoreSpec};
-use nativelink_error::Error;
+use nativelink_error::{Error, VERSION_MESSAGE_SUFFIX};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::ContentAddressableStorage;
@@ -318,7 +318,7 @@ async fn batch_read_blobs_read_two_blobs_success_one_fail()
                         status: Some(GrpcStatus {
                             code: Code::NotFound as i32,
                             message: format!(
-                                "Key {:?} not found",
+                                "Key {:?} not found{VERSION_MESSAGE_SUFFIX}",
                                 StoreKey::from(DigestInfo::try_from(digest3)?)
                             ),
                             details: vec![],

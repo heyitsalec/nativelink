@@ -18,7 +18,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use nativelink_config::cas_server::WithInstanceName;
 use nativelink_config::stores::{MemorySpec, StoreSpec};
-use nativelink_error::Error;
+use nativelink_error::{Error, VERSION_MESSAGE_SUFFIX};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -116,7 +116,8 @@ async fn empty_store() -> Result<(), Box<dyn core::error::Error>> {
 
     let err = raw_response.unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
-    assert!(err.message().is_empty());
+    // An otherwise-empty message carries just the version marker (#1044).
+    assert_eq!(err.message(), VERSION_MESSAGE_SUFFIX.trim_start());
 
     Ok(())
 }
@@ -161,7 +162,8 @@ async fn single_item_wrong_digest_size() -> Result<(), Box<dyn core::error::Erro
 
     let err = raw_response.unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
-    assert!(err.message().is_empty());
+    // An otherwise-empty message carries just the version marker (#1044).
+    assert_eq!(err.message(), VERSION_MESSAGE_SUFFIX.trim_start());
     Ok(())
 }
 

@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use futures::stream;
 use nativelink_config::cas_server::{ExecutionConfig, WithInstanceName};
 use nativelink_config::stores::{MemorySpec, StoreSpec};
-use nativelink_error::{Code, Error, make_err};
+use nativelink_error::{Code, Error, VERSION_MESSAGE_SUFFIX, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::execution_server::Execution;
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -106,7 +106,9 @@ async fn instance_name_fail() -> Result<(), Box<dyn core::error::Error>> {
         Err(response_err) => {
             assert_eq!(
                 response_err.message(),
-                "'instance_name' not configured for 'foo' : Failed on execute() command"
+                format!(
+                    "'instance_name' not configured for 'foo' : Failed on execute() command{VERSION_MESSAGE_SUFFIX}"
+                )
             );
         }
         Ok(_) => {

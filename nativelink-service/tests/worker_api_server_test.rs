@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::cas_server::WorkerApiConfig;
 use nativelink_config::schedulers::WorkerAllocationStrategy;
-use nativelink_error::{Error, ResultExt, make_err};
+use nativelink_error::{Error, ResultExt, VERSION_MESSAGE_SUFFIX, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -511,7 +511,9 @@ pub async fn execution_response_success_test() -> Result<(), Box<dyn core::error
         cached_result: false,
         status: Some(ProtoStatus {
             code: 9,
-            message: "foo".to_string(),
+            // Carries the version marker so the ActionStage->ExecuteResponse
+            // round trip in this test is a fixed point (#1044).
+            message: format!("foo{VERSION_MESSAGE_SUFFIX}"),
             details: Vec::default(),
         }),
         server_logs,
