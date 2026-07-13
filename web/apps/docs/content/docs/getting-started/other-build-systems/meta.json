@@ -4,7 +4,8 @@
     "siso",
     "pants",
     "buildstream",
-    "cmake-recc"
+    "cmake-recc",
+    "icecream"
   ],
   "title": "Other build systems"
 }
