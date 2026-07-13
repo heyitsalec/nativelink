@@ -1,0 +1,104 @@
+{
+  stores: [
+    {
+      // Azure blob store (Azurite emulator) for CAS data.
+      //
+      // The SAS token below is deterministic and PUBLIC: it is signed with
+      // the documented Azurite well-known dev account key for
+      // devstoreaccount1, which Microsoft publishes for emulator use. There
+      // are no secrets in this file.
+      name: "AZURE_CAS",
+      experimental_cloud_object_store: {
+        provider: "azure",
+        sas_url: "http://127.0.0.1:10000/devstoreaccount1/nativelink-cas?sv=2022-11-02&ss=b&srt=co&sp=rwdlac&st=2020-01-01T00:00:00Z&se=2099-01-01T00:00:00Z&spr=https,http&sig=JXUVFU%2FxumX1QKPqDU2%2FSfTR8TUdLRmQkVtXY2P%2BDpk%3D",
+        retry: {
+          max_retries: 6,
+          delay: 0.3,
+          jitter: 0.5,
+        },
+      },
+    },
+    {
+      // Example of chaining stores with the Azure backend.
+      name: "PRODUCTION_CAS",
+      fast_slow: {
+        fast: {
+          memory: {
+            eviction_policy: {
+              max_bytes: "1gb",
+            },
+          },
+        },
+        slow: {
+          compression: {
+            compression_algorithm: {
+              lz4: {},
+            },
+            backend: {
+              ref_store: {
+                name: "AZURE_CAS",
+              },
+            },
+          },
+        },
+      },
+    },
+  ],
+  schedulers: [
+    {
+      name: "MAIN_SCHEDULER",
+      simple: {
+        supported_platform_properties: {
+          cpu_arch: "minimum",
+          OS: "exact",
+        },
+        max_job_retries: 3,
+        worker_timeout_s: 300,
+      },
+    },
+  ],
+  servers: [
+    {
+      listener: {
+        http: {
+          socket_address: "0.0.0.0:50051",
+        },
+      },
+      services: {
+        cas: [
+          {
+            instance_name: "",
+            cas_store: "PRODUCTION_CAS",
+          },
+        ],
+        ac: [
+          {
+            instance_name: "",
+            ac_store: "AZURE_CAS",
+          },
+        ],
+        execution: [
+          {
+            instance_name: "",
+            cas_store: "PRODUCTION_CAS",
+            scheduler: "MAIN_SCHEDULER",
+          },
+        ],
+        capabilities: [
+          {
+            instance_name: "",
+            remote_execution: {
+              scheduler: "MAIN_SCHEDULER",
+            },
+          },
+        ],
+        bytestream: [
+          {
+            instance_name: "",
+            cas_store: "PRODUCTION_CAS",
+          },
+        ],
+      },
+    },
+  ],
+}

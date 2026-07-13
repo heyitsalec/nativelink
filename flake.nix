@@ -436,6 +436,10 @@
             mongo-with-nativelink-test = pkgs.callPackage integration_tests/mongo/mongo-with-nativelink-test.nix {
               inherit nativelink mongodb wait4x bazelisk;
             };
+            azure-with-nativelink-test = pkgs.callPackage integration_tests/azure/azurite-with-nativelink-test.nix {
+              inherit nativelink wait4x bazelisk;
+              inherit (pkgs) azurite curl;
+            };
             rbe-toolchain-with-nativelink-test = pkgs.callPackage toolchain-examples/rbe-toolchain-test.nix {
               inherit nativelink bazelisk;
             };
