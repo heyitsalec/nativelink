@@ -113,6 +113,25 @@ clients. Snapshot strategy depends on the backend:
 The Action Cache can be wiped without data loss; you'll re-execute
 everything until it warms back up.
 
+## Troubleshooting
+
+<Callout type="warn" title="No route to host from macOS workers">
+  macOS [Local Network Privacy](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
+  can block a worker's gRPC connections to the scheduler — `tcp connect
+  error … No route to host` (os error 65) — while `ping`, SSH, and even
+  `nc -vz` against the same host and port keep working. Restarting the
+  worker doesn't clear it; rebooting does, until it recurs.
+  Command-line tools run from Terminal or over SSH (including their
+  child processes) are supposed to be exempt, but the exemption misses,
+  or applies non-deterministically, when the worker runs inside a
+  `tmux` session spawned directly from SSH — and macOS never shows a
+  permission prompt for `tmux`. The workaround suggested in the issue
+  thread is to run `nativelink` as a `launchd` service, or to spawn
+  `tmux` itself from `launchd`, instead of launching workers from an
+  SSH session. See
+  [issue #1694](https://github.com/TraceMachina/nativelink/issues/1694).
+</Callout>
+
 ## What's next
 
 - [Configuration → Production](/configuration/production) — the
