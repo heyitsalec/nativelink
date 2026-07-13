@@ -923,6 +923,17 @@ pub struct LocalWorkerConfig {
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
     pub max_cleanup_backoff_ms: usize,
 
+    /// Maximum time to wait, after the connection to the scheduler is lost,
+    /// for actions still in transit (accepted from the scheduler but not
+    /// yet registered with the running-actions manager) to settle before
+    /// the worker kills local actions and reconnects. If the timeout is
+    /// exceeded an error is logged and recovery proceeds anyway. Value in
+    /// seconds.
+    ///
+    /// Default: 60 seconds
+    #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    pub max_actions_in_transit_wait_s: usize,
+
     /// Maximum number of inflight tasks this worker can cope with.
     ///
     /// Default: 0 (infinite tasks)
@@ -1195,5 +1206,36 @@ mod tests {
         let config: CapabilitiesConfig = serde_json5::from_str("{}").unwrap();
 
         assert!(!config.remote_cache_compression);
+    }
+
+    #[test]
+    fn local_worker_config_max_actions_in_transit_wait_deserializes() {
+        let config: LocalWorkerConfig = serde_json5::from_str(
+            r#"{
+                "worker_api_endpoint": {"uri": "grpc://127.0.0.1:50051"},
+                "cas_fast_slow_store": "WORKER_FAST_SLOW_STORE",
+                "work_directory": "/tmp/nativelink/work",
+                "platform_properties": {},
+                "max_actions_in_transit_wait_s": 120,
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_actions_in_transit_wait_s, 120);
+    }
+
+    #[test]
+    fn local_worker_config_max_actions_in_transit_wait_defaults_zero() {
+        let config: LocalWorkerConfig = serde_json5::from_str(
+            r#"{
+                "worker_api_endpoint": {"uri": "grpc://127.0.0.1:50051"},
+                "cas_fast_slow_store": "WORKER_FAST_SLOW_STORE",
+                "work_directory": "/tmp/nativelink/work",
+                "platform_properties": {},
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_actions_in_transit_wait_s, 0);
     }
 }

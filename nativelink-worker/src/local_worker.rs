@@ -57,9 +57,14 @@ use crate::running_actions_manager::{
 use crate::worker_api_client_wrapper::{WorkerApiClientTrait, WorkerApiClientWrapper};
 use crate::worker_utils::make_connect_worker_request;
 
-/// Amount of time to wait if we have actions in transit before we try to
-/// consider an error to have occurred.
-const ACTIONS_IN_TRANSIT_TIMEOUT_S: f32 = 10.;
+/// Default amount of time to wait for actions in transit (accepted from
+/// the scheduler but not yet registered with the running-actions manager)
+/// to settle after the scheduler connection is lost, before the worker
+/// proceeds to kill local actions and reconnect. Used when
+/// `max_actions_in_transit_wait_s` is not set in the worker config. If
+/// this value gets modified the documentation in `cas_server.rs` must
+/// also be updated.
+const DEFAULT_ACTIONS_IN_TRANSIT_TIMEOUT_S: f32 = 60.;
 
 /// If we lose connection to the worker api server we will wait this many seconds
 /// before trying to connect.
@@ -68,6 +73,31 @@ const CONNECTION_RETRY_DELAY_S: f32 = 0.5;
 /// Default endpoint timeout. If this value gets modified the documentation in
 /// `cas_server.rs` must also be updated.
 const DEFAULT_ENDPOINT_TIMEOUT_S: f32 = 5.;
+
+/// RAII accounting for `actions_in_transit`: increments the counter on
+/// creation and decrements it exactly once on drop. The decrement must be
+/// drop-based because start-action tasks are spawned with abort-on-drop
+/// handles (`spawn!`); when the scheduler connection is lost,
+/// `LocalWorkerImpl::run` returns and those tasks are aborted, so a plain
+/// decrement placed after registration would never execute and the
+/// disconnect drain loop would wait on a counter that can no longer reach
+/// zero.
+struct ActionsInTransitGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl ActionsInTransitGuard {
+    fn new(counter: Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Release);
+        Self { counter }
+    }
+}
+
+impl Drop for ActionsInTransitGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
 
 /// Default maximum amount of time a task is allowed to run for.
 /// If this value gets modified the documentation in `cas_server.rs` must also be updated.
@@ -315,7 +345,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         extra_envs.insert(name.clone(), value.into_owned());
                                     }
                                 }
-                                let actions_in_transit = self.actions_in_transit.clone();
+                                let actions_in_transit_guard =
+                                    ActionsInTransitGuard::new(self.actions_in_transit.clone());
                                 let worker_id = self.worker_id.clone();
                                 let running_actions_manager = self.running_actions_manager.clone();
                                 let mut grpc_client = self.grpc_client.clone();
@@ -327,8 +358,9 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     .and_then(|()| running_actions_manager.create_and_add_action(worker_id, start_execute))
                                     .map(move |r| {
                                         // Now that we either failed or registered our action, we can
-                                        // consider the action to no longer be in transit.
-                                        actions_in_transit.fetch_sub(1, Ordering::Release);
+                                        // consider the action to no longer be in transit. The guard
+                                        // also decrements if this task is aborted on disconnect.
+                                        drop(actions_in_transit_guard);
                                         r
                                     })
                                     .and_then(|action| {
@@ -437,8 +469,6 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     Ok(())
                                 }
                             };
-
-                            self.actions_in_transit.fetch_add(1, Ordering::Release);
 
                             let add_future_channel = add_future_channel.clone();
 
@@ -852,6 +882,12 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
             (sleep_fn_pin)(Duration::from_secs_f32(CONNECTION_RETRY_DELAY_S)).await;
         });
 
+        let actions_in_transit_timeout_s = if self.config.max_actions_in_transit_wait_s == 0 {
+            DEFAULT_ACTIONS_IN_TRANSIT_TIMEOUT_S
+        } else {
+            self.config.max_actions_in_transit_wait_s as f32
+        };
+
         loop {
             // First connect to our endpoint.
             let mut client = match (self.connection_factory)().await {
@@ -893,17 +929,27 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
                     // all our actions.
                     const ITERATIONS: usize = 1_000;
 
-                    const ERROR_MSG: &str = "Actions in transit did not reach zero before we disconnected from the scheduler";
-
-                    let sleep_duration = ACTIONS_IN_TRANSIT_TIMEOUT_S / ITERATIONS as f32;
+                    let sleep_duration = actions_in_transit_timeout_s / ITERATIONS as f32;
                     for _ in 0..ITERATIONS {
                         if inner.actions_in_transit.load(Ordering::Acquire) == 0 {
                             break 'no_more_actions;
                         }
                         (sleep_fn_pin)(Duration::from_secs_f32(sleep_duration)).await;
                     }
-                    error!(ERROR_MSG);
-                    return Err(err.append(ERROR_MSG));
+                    // The in-transit tasks were already aborted when
+                    // `inner.run` returned (their spawn handles abort on
+                    // drop), so they can no longer register or execute.
+                    // Historically exceeding this timeout was fatal to the
+                    // whole worker process, but a dropped scheduler stream
+                    // is a routine transient (e.g. load-balancer idle
+                    // timeouts), so log loudly and continue with recovery
+                    // instead. See issue #2115.
+                    error!(
+                        timeout_s = actions_in_transit_timeout_s,
+                        "Actions in transit did not reach zero before we \
+                        disconnected from the scheduler; continuing with \
+                        reconnect anyway"
+                    );
                 }
                 error!(?err, "Worker disconnected from scheduler");
                 // Kill off any existing actions because if we re-connect, we'll
