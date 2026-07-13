@@ -676,3 +676,31 @@ mod convert_optional_numeric_with_shellexpand_tests {
         assert_eq!(deserialized.value, None);
     }
 }
+
+mod azure_spec_tests {
+    use nativelink_config::stores::ExperimentalAzureSpec;
+    use pretty_assertions::assert_eq;
+
+    /// The `root_certificates` CA-pinning override added for issue #441.
+    #[test]
+    fn test_azure_root_certificates_field() {
+        let spec: ExperimentalAzureSpec = serde_json5::from_str(
+            r#"{
+                account_name: "acct",
+                container: "cont",
+                root_certificates: "/path/to/ca.pem",
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(spec.root_certificates.as_deref(), Some("/path/to/ca.pem"));
+    }
+
+    /// Absent means "use the platform's native trust store" and must keep
+    /// existing configs loading unchanged.
+    #[test]
+    fn test_azure_root_certificates_defaults_to_none() {
+        let spec: ExperimentalAzureSpec =
+            serde_json5::from_str(r#"{account_name: "acct", container: "cont"}"#).unwrap();
+        assert_eq!(spec.root_certificates, None);
+    }
+}
