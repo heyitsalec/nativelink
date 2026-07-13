@@ -376,6 +376,13 @@ where
                     .create_multipart_upload()
                     .bucket(&self.bucket)
                     .key(s3_path)
+                    .customize()
+                    // GCS's S3-compatible API rejects empty-body multipart
+                    // requests that lack an explicit content-length header,
+                    // while real S3 accepts an explicit zero. See issue #491.
+                    .mutate_request(|req| {
+                        req.headers_mut().insert("content-length", "0");
+                    })
                     .send()
                     .await
                     .map_or_else(
@@ -553,6 +560,12 @@ where
                     .bucket(&self.bucket)
                     .key(s3_path)
                     .upload_id(upload_id)
+                    .customize()
+                    // Same as create_multipart_upload above: GCS's S3-compat
+                    // API requires an explicit content-length. See issue #491.
+                    .mutate_request(|req| {
+                        req.headers_mut().insert("content-length", "0");
+                    })
                     .send()
                     .await;
                 if let Err(abort_err) = abort_res {

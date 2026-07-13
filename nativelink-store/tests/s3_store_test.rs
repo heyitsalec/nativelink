@@ -575,6 +575,122 @@ async fn multipart_update_large_cas() -> Result<(), Error> {
     Ok(())
 }
 
+// Regression test for issue #491: GCS's S3-compatible API rejects the
+// empty-body multipart calls (CreateMultipartUpload and
+// AbortMultipartUpload) unless they carry an explicit `content-length: 0`
+// header, while real S3 accepts the explicit zero. This test only inspects
+// the outgoing request headers; live GCS behavior is not covered.
+#[nativelink_test]
+async fn multipart_create_and_abort_send_zero_content_length() -> Result<(), Error> {
+    // The request half of each ReplayEvent is not validated here (we assert
+    // on `actual_requests` instead of `assert_requests_match`), so dummy
+    // requests are used.
+    fn dummy_request() -> http::Request<SdkBody> {
+        http::Request::builder()
+            .uri("https://dummy")
+            .body(SdkBody::empty())
+            .unwrap()
+    }
+    fn part_failure() -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(SdkBody::empty())
+            .unwrap()
+    }
+
+    // Same as in s3_store.
+    const MIN_MULTIPART_SIZE: usize = 5 * 1024 * 1024; // 5mb.
+    const AC_ENTRY_SIZE: usize = MIN_MULTIPART_SIZE * 2 + 50;
+
+    let mut send_data: Vec<u8> = Vec::with_capacity(AC_ENTRY_SIZE);
+    for i in 0..send_data.capacity() {
+        send_data.push(u8::try_from((i * 3) % 256).expect("modulo 256 always fits in u8"));
+    }
+    let digest = DigestInfo::try_new(VALID_HASH1, send_data.len())?;
+
+    let mock_client = StaticReplayClient::new(vec![
+        ReplayEvent::new(
+            dummy_request(),
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body(SdkBody::from(
+                    r#"
+                    <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                      <UploadId>Dummy-uploadid</UploadId>
+                    </InitiateMultipartUploadResult>"#
+                        .as_bytes(),
+                ))
+                .unwrap(),
+        ),
+        // All part uploads fail (their relative order is nondeterministic
+        // under concurrent uploads), forcing the abort_multipart_upload
+        // cleanup path.
+        ReplayEvent::new(dummy_request(), part_failure()),
+        ReplayEvent::new(dummy_request(), part_failure()),
+        ReplayEvent::new(dummy_request(), part_failure()),
+        // Response for the abort request; its status is irrelevant here.
+        ReplayEvent::new(
+            dummy_request(),
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .body(SdkBody::empty())
+                .unwrap(),
+        ),
+    ]);
+    let test_config = Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::from_static(REGION))
+        // Disable the SDK's own retries so each failing part results in
+        // exactly one HTTP request and the replay events stay deterministic.
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .http_client(mock_client.clone())
+        .build();
+    let s3_client = aws_sdk_s3::Client::from_conf(test_config);
+    let store = S3Store::new_with_client_and_jitter(
+        &ExperimentalAwsSpec {
+            bucket: BUCKET_NAME.to_string(),
+            ..Default::default()
+        },
+        s3_client,
+        Arc::new(move |_delay| Duration::from_secs(0)),
+        MockInstantWrapped::default,
+    )?;
+
+    // The upload must fail overall (all parts failed), which is what routes
+    // us through abort_multipart_upload.
+    assert!(
+        store
+            .update_oneshot(digest, send_data.clone().into())
+            .await
+            .is_err(),
+        "Expected multipart upload to fail so the abort path runs"
+    );
+
+    let requests: Vec<_> = mock_client.actual_requests().collect();
+
+    let create_request = requests
+        .iter()
+        .find(|req| req.method() == "POST" && req.uri().ends_with("?uploads"))
+        .expect("Expected a CreateMultipartUpload request to have been sent");
+    assert_eq!(
+        create_request.headers().get("content-length"),
+        Some("0"),
+        "CreateMultipartUpload must send an explicit content-length of zero"
+    );
+
+    let abort_request = requests
+        .iter()
+        .find(|req| req.method() == "DELETE")
+        .expect("Expected an AbortMultipartUpload request to have been sent");
+    assert_eq!(
+        abort_request.headers().get("content-length"),
+        Some("0"),
+        "AbortMultipartUpload must send an explicit content-length of zero"
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn ensure_empty_string_in_stream_works_test() -> Result<(), Error> {
     const CAS_ENTRY_SIZE: usize = 10; // Length of "helloworld".
