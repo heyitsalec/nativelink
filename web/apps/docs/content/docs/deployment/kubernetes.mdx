@@ -3,10 +3,72 @@ title: Kubernetes
 description: Deploy NativeLink on Kubernetes — what each workload looks like, where state lives, how to autoscale workers.
 ---
 
-NativeLink ships with a reference Kubernetes deployment in the
-[`deployment-examples/kubernetes/`](https://github.com/TraceMachina/nativelink/tree/main/deployment-examples/kubernetes)
-directory. This page covers the shape; the chart there has the
-manifests.
+For most users, the recommended way to deploy NativeLink is the
+official
+[Helm chart on Artifact Hub](https://artifacthub.io/packages/helm/nativelink/nativelink).
+The repository additionally ships Kustomize building blocks in
+[`kubernetes/`](https://github.com/TraceMachina/nativelink/tree/main/kubernetes)
+— per its README, supplementary reference points for advanced
+customization beyond what the Helm chart provides — plus a composed
+example in
+[`deploy/kubernetes-example/`](https://github.com/TraceMachina/nativelink/tree/main/deploy/kubernetes-example).
+This page covers what those blocks deploy and the general shape of a
+production cluster.
+
+## The in-repo Kustomize base
+
+[`kubernetes/nativelink/`](https://github.com/TraceMachina/nativelink/tree/main/kubernetes/nativelink)
+holds the core: one `nativelink` Deployment and Service, with the
+JSON5 config injected via a `configMapGenerator` and the image pinned
+by Kustomize. The container is wired for the OTLP metrics flow out of
+the box:
+
+```yaml
+      containers:
+        - name: nativelink
+          # This image will be edited by kustomize.
+          image: nativelink
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector-collector.default.svc:4317
+            - name: OTEL_EXPORTER_OTLP_COMPRESSION
+              value: zstd
+          ports:
+            - containerPort: 9090
+            - containerPort: 50051
+            - containerPort: 50052
+            - containerPort: 50061
+```
+
+The Service exposes those ports as `metrics` (9090), `grpc` (50051),
+`grpcs` (50052), and `worker-api` (50061).
+
+Around that core:
+
+- [`kubernetes/components/worker/`](https://github.com/TraceMachina/nativelink/tree/main/kubernetes/components/worker)
+  — the generic worker component (Deployment plus its `worker.json5`).
+- [`kubernetes/workers/`](https://github.com/TraceMachina/nativelink/tree/main/kubernetes/workers)
+  — concrete worker overlays: `lre-cc`, `lre-rs`, and `siso-chromium`,
+  plus a shared `worker-init` resource.
+- [`kubernetes/resources/`](https://github.com/TraceMachina/nativelink/tree/main/kubernetes/resources)
+  — supporting pieces: Flux `GitRepository` and Kustomizations,
+  cert-manager, gateway routes, and insecure test certificates
+  (explicitly not for production).
+
+[`deploy/kubernetes-example/`](https://github.com/TraceMachina/nativelink/tree/main/deploy/kubernetes-example)
+composes a working cluster from those blocks — Flux resources,
+`nativelink-core`, gateway routes, `worker-init`, and the `lre-cc`
+worker — so it assumes a Flux-managed GitOps flow rather than a bare
+`kubectl apply`.
+
+<Callout type="info" title="The manifests below are illustrative">
+  The rest of this page sketches a from-scratch production shape with
+  separate CAS, scheduler, and worker workloads. These snippets are
+  patterns to adapt, not files from the repository — for runnable
+  manifests, use the Helm chart or the Kustomize blocks above.
+</Callout>
 
 ## Workload layout
 
@@ -125,15 +187,21 @@ spec:
     - type: External
       external:
         metric:
-          name: nativelink_scheduler_queue_depth
+          name: nativelink_execution_active_count
+          selector:
+            matchLabels:
+              execution_stage: queued
         target:
           type: Value
           averageValue: "20"
 ```
 
-Scale on `nativelink_scheduler_queue_depth` — the Prometheus metric
-the scheduler exports. Plain CPU-based scaling doesn't react fast
-enough; workers spend most of their time blocked on I/O.
+Scale on `nativelink_execution_active_count{execution_stage="queued"}`
+— NativeLink exports it over OTLP, so surface it to the HPA by letting
+Prometheus scrape your OpenTelemetry Collector and running an
+external-metrics adapter (prometheus-adapter or KEDA) on top. Plain
+CPU-based scaling doesn't react fast enough; workers spend most of
+their time blocked on I/O.
 
 ## Service & Ingress
 
@@ -159,18 +227,22 @@ Make sure the Ingress controller supports gRPC end-to-end (NGINX with
 
 ## A complete reference
 
-The
-[`deployment-examples/kubernetes/`](https://github.com/TraceMachina/nativelink/tree/main/deployment-examples/kubernetes)
-directory in the source tree has:
+Where everything lives:
 
-- A Helm chart with values for dev / staging / prod.
-- A Kustomize overlay set.
-- An example `prometheus-rules.yaml` covering the alerts we run.
-- A working HPA on queue depth (the `keda` adapter is included for
-  installations using it).
+- The official [Helm chart on Artifact Hub](https://artifacthub.io/packages/helm/nativelink/nativelink)
+  — the recommended install route.
+- [`kubernetes/`](https://github.com/TraceMachina/nativelink/tree/main/kubernetes)
+  — the Kustomize building blocks described above.
+- [`deploy/kubernetes-example/`](https://github.com/TraceMachina/nativelink/tree/main/deploy/kubernetes-example)
+  — a Flux-based composition of those blocks with a ready-to-edit
+  NativeLink config.
+- [`deployment-examples/metrics/`](https://github.com/TraceMachina/nativelink/tree/main/deployment-examples/metrics)
+  — the observability stack: OpenTelemetry Collector and Prometheus
+  manifests for Kubernetes, Prometheus recording rules (including the
+  queue-depth series above), and an `alertmanager-config.yml`.
 
-Clone the repo, point at your cluster, `helm install`. Tune from
-there.
+Clone the repo and start from whichever entry point matches how you
+run clusters. Tune from there.
 
 ## What's next
 

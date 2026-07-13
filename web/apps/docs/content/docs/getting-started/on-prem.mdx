@@ -58,7 +58,7 @@ each independently.
   <li>
     **Pick the deployment substrate.** Most teams land on one of:
     - **Kubernetes** — see [Deployment → Kubernetes](/deployment/kubernetes)
-      for a working chart.
+      for a working Kustomize deployment.
     - **Bare VMs** — `systemd` units, one binary per role, with a load
       balancer in front.
     - **Docker Compose** — a reasonable starting point for ≤ 5
@@ -79,9 +79,9 @@ each independently.
     has the certificate layout.
   </li>
   <li>
-    **Wire up metrics.** NativeLink emits Prometheus metrics out of the
-    box. Point Grafana at it. See
-    [Deployment → Metrics](/deployment/metrics).
+    **Wire up metrics.** NativeLink emits OTLP metrics — run an
+    OpenTelemetry Collector, scrape it with Prometheus, and point
+    Grafana at that. See [Deployment → Metrics](/deployment/metrics).
   </li>
 </Steps>
 
@@ -118,6 +118,6 @@ everything until it warms back up.
 - [Configuration → Production](/configuration/production) — the
   JSON5 shape for a real cluster.
 - [Deployment → Kubernetes](/deployment/kubernetes) — a working
-  Helm chart.
-- [Deployment → Metrics](/deployment/metrics) — Prometheus and
-  Grafana, ready to go.
+  Kustomize deployment.
+- [Deployment → Metrics](/deployment/metrics) — OTLP into
+  Prometheus and Grafana, ready to go.

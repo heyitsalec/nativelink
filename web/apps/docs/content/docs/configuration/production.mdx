@@ -151,7 +151,8 @@ workers: [{
 
 Drive worker count from queue depth — every common autoscaler
 (Kubernetes HPA on a custom metric, AWS Auto Scaling on a CloudWatch
-alarm) can read NativeLink's Prometheus output and scale accordingly.
+alarm) can watch NativeLink's queued-actions metric and scale
+accordingly.
 The [Kubernetes deployment guide](/deployment/kubernetes) has a
 working HPA config.
 
@@ -185,30 +186,34 @@ provider list.
 
 ## Observability
 
-NativeLink emits OpenTelemetry traces and Prometheus metrics out of
-the box. Enable them in the config:
+NativeLink emits OpenTelemetry logs, traces, and metrics over OTLP.
+It has no config-file switch and no built-in Prometheus scrape
+endpoint: set the standard `OTEL_*` environment variables on every
+NativeLink process, and run an OpenTelemetry Collector (or Prometheus
+with its OTLP receiver enabled) to receive what they send:
 
-```json5
-global: {
-  metrics: { prometheus: { listen_address: "0.0.0.0:9090" } },
-  tracing: {
-    otlp: { endpoint: "http://otel-collector:4317" },
-    sample_rate: 0.05,
-  },
-},
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+export OTEL_RESOURCE_ATTRIBUTES="deployment.environment=prod"
 ```
+
+Execution-pipeline metrics flow without further config. Cache
+hit-rate and latency series are opt-in — wrap the store you want
+measured in a `cache_metrics` store.
 
 What's worth alerting on:
 
-- `nativelink_cas_request_duration_seconds_p99` — sub-millisecond on
-  a healthy cluster. Anything over 50ms is page-worthy.
-- `nativelink_scheduler_queue_depth` — should drop quickly when
-  workers are healthy.
-- `nativelink_worker_connected_count` — sudden drops indicate
-  scheduler-side issues.
+- `nativelink_execution_active_count{execution_stage="queued"}` —
+  queued actions; should drop quickly when workers are healthy.
+- `nativelink_execution_completed_count_total{execution_result="success"}`
+  as a ratio of all completions — overall success rate.
+- `nativelink_cache_operations_total{cache_operation_result="hit"}`
+  as a ratio of reads — cache hit rate (needs `cache_metrics`).
 
-The [Metrics deployment guide](/deployment/metrics) has a Grafana
-dashboard JSON file you can import.
+The [Metrics deployment guide](/deployment/metrics) has the full
+metrics catalog, collector and Prometheus setups, example queries,
+and a Grafana dashboard JSON file you can import.
 
 ## A reference production config
 
